@@ -1,0 +1,1385 @@
+QQQuest 後台控制系統完整說明文件
+版本：依 2026-04-24 專案程式碼整理
+
+============================================================
+1. 這份文件的目的
+============================================================
+
+這份文件是給以下幾種人使用的：
+
+1. 第一次接手 QQQuest 專案的人
+2. 需要操作房間管理、設備管理、群控流程的人
+3. 需要修改 Python / Node.js / Unity client 的工程師
+4. 需要排查「為什麼某台 Quest 沒反應、沒連上、沒切回遊戲、沒同步座標」的人
+
+這份文件會同時說明：
+
+- 這個系統的整體架構
+- Python / Streamlit 後台頁面是怎麼工作的
+- Node.js room socket server 在做什麼
+- TCP/IP 在這個專案裡扮演什麼角色
+- ADB 和 scrcpy 如何介入 Quest 管理
+- Unity client 如何和 server 通訊
+- 房間管理頁各個操作真正對應到哪段程式
+- 常見故障點與排查方向
+- 哪裡適合補圖片、流程圖、操作截圖
+
+如果只想先抓一句話版：
+
+QQQuest 是一個用 Streamlit 做管理介面、用 Python 控 ADB / scrcpy、用 Node.js 為每個房間開一個 TCP socket server、再讓 Unity client 持續送 heartbeat 與接收控制指令的多設備 Quest 管理系統。
+
+
+============================================================
+2. 系統的核心概念
+============================================================
+
+這個系統其實是由四層組成：
+
+第 1 層：管理介面層
+- 技術：Python + Streamlit
+- 主要用途：讓使用者用瀏覽器管理設備、房間、動作、監看、群控
+
+第 2 層：設備控制層
+- 技術：Python + ADB + scrcpy
+- 主要用途：連 Quest、查狀態、啟動 App、切回遊戲、鏡像畫面、抓 logcat
+
+第 3 層：房間即時通訊層
+- 技術：Node.js + net.createServer() + raw TCP/IP JSON protocol
+- 主要用途：讓同一房間的所有 Unity client 連進來，交換 heartbeat、章節、sequence、focus、位置等資訊
+
+第 4 層：Quest 端 client 層
+- 技術：Unity C#
+- 主要用途：連到 room socket server、送 heartbeat、接收 move command、接收 sequence、上報 focus 狀態、同步使用者位置
+
+可以把它想成：
+
+瀏覽器 UI
+  -> Streamlit / Python
+      -> ADB / scrcpy 控硬體
+      -> Node.js TCP room server 控即時多人通訊
+          -> Unity client in Quest
+
+
+============================================================
+3. 重要技術名詞先講清楚
+============================================================
+
+3.1 Node.js 是什麼
+
+Node.js 是執行 JavaScript 的伺服器端執行環境。這個專案裡，它不是拿來做網頁 API，而是拿來做每個房間一個獨立的 TCP server。
+
+這樣做的原因是：
+
+- Unity client 比較適合長連線
+- 房間內需要低延遲的即時訊息交換
+- 一個房間一個 process，比較好隔離狀態與日誌
+- 用 Node 的 event loop 做 socket server 很直接
+
+本專案裡的 Node.js server 檔案是：
+
+- servers/room_socket_server.js
+
+
+3.2 TCP/IP 是什麼
+
+TCP/IP 是網路通訊協定族。這裡最重要的是 TCP。
+
+TCP 的特性：
+
+- 是可靠傳輸
+- 資料有順序
+- 但它是「位元組流」不是「訊息包」
+
+這句話非常重要。
+
+因為 TCP 不會自動告訴你「這一筆 JSON 到哪裡結束」，所以你不能假設一次 recv 就一定只收到一筆完整 JSON。可能會發生：
+
+- 一次收到半筆 JSON
+- 一次收到兩筆 JSON 黏在一起
+- 一筆 JSON 被拆成很多段才收到完
+
+所以這個專案必須自己做「訊息 framing」。
+
+本專案採用兩種處理方式：
+
+1. Unity client 送出時，在每筆 JSON 後面補一個換行 `\n`
+2. Node.js server 端除了支援 newline-delimited JSON，也額外做了大括號計數 parser，能從 stream 中切出完整 JSON
+
+這也是為什麼這個專案不是 HTTP，也不是 WebSocket，而是 raw TCP + JSON。
+
+
+3.3 ADB 是什麼
+
+ADB = Android Debug Bridge。
+
+它是這個系統能真正控制 Quest 的關鍵工具。只靠 Node socket server，是無法直接把 Quest 從系統層拉回遊戲的；真正切畫面、查焦點、開 App、按 Back、開 scrcpy，都是靠 ADB。
+
+這個專案裡，ADB 主要被用來做：
+
+- `adb connect <ip>:5555`
+- `adb shell am start ...`
+- `adb shell input keyevent ...`
+- `adb shell dumpsys ...`
+- `adb logcat`
+- `scrcpy -s <device>`
+
+
+3.4 scrcpy 是什麼
+
+scrcpy 是 Android 畫面鏡像工具。這個專案用它做 Quest 的監看牆。
+
+注意：
+
+- scrcpy 是「畫面監看」工具，不是 socket 通訊工具
+- 即時狀態表格的資料不是從 scrcpy 來的，而是從 Unity heartbeat 來的
+- ADB / logcat / scrcpy 是同一條 Android 調試管線上的不同用途
+
+
+============================================================
+4. 專案目錄與模組分工
+============================================================
+
+4.1 入口與啟動
+
+- `run.sh`
+  啟動虛擬環境、安裝依賴、執行 `streamlit run app.py`
+
+- `app.py`
+  Streamlit 首頁入口。這頁目前比較像簡介頁，不是功能最完整的頁面。
+
+
+4.2 Streamlit 頁面
+
+- `pages/1_📱_設備管理.py`
+  管理單台設備、設備狀態、Wi-Fi ADB 連線、設備卡片操作
+
+- `pages/2_🏠_房間管理.py`
+  本專案最核心的操作頁。房間、群控、Socket Server 監看、即時狀態、CCTV 監看牆、切回遊戲、位置同步幾乎都在這裡
+
+- `pages/3_⚡_動作管理.py`
+  建立可重複使用的動作模板，例如開 App、Resume App、Sleep、Wake
+
+- `pages/4_⚙️_系統設定.py`
+  scrcpy、截圖預覽、網路監控、匯入匯出設定
+
+
+4.3 Python 核心模組
+
+- `core/adb_manager.py`
+  這是硬體控制核心。所有真正碰 Quest 的 ADB 操作都在這裡
+
+- `core/device_registry.py`
+  設備資料持久化與查詢
+
+- `core/room_registry.py`
+  房間資料持久化與查詢
+
+- `core/action_registry.py`
+  動作模板的持久化與查詢
+
+- `core/socket_client.py`
+  Python 端連到 Node room socket server 的 TCP client
+
+- `core/socket_server_manager.py`
+  啟動 / 停止 / 重啟每個房間的 Node.js TCP server
+
+- `core/auto_connect_manager.py`
+  網路監控與自動重連的 retry / cooldown 狀態
+
+- `core/ping_service.py`
+  背景非阻塞 ping 檢查
+
+
+4.4 Node.js server
+
+- `servers/room_socket_server.js`
+  每個房間各自啟動一份的 TCP server
+
+
+4.5 Unity client
+
+- `CoPlayerSocketMgr.cs`
+  目前 root 這份是近期整合中實際在修改的主版本
+
+- `QuestFocusSafeTimeline.cs`
+  監聽 Quest focus / pause 事件，讓 timeline / audio / focus 通知更穩定
+
+- `client_scripts/HeightCalibrationClient.cs`
+  用來接收 `height_calibration` 命令並調整指定物件高度
+
+- `client_scripts/CoPlayerSocketMgr.cs`
+  另一份 CoPlayerSocketMgr 副本。它可能是舊版、備份版、或 Unity 專案內另一個來源。真正 build 時哪一份生效，要以 Unity 專案內實際掛載與引用為準
+
+
+4.6 資料檔
+
+- `data/devices.json`
+- `data/device_registry.json`
+- `data/rooms.json`
+- `data/actions.json`
+- `data/user_config.json`
+- `time_events.json`
+
+這些檔案大多是 TinyDB 或 JSON 設定持久化。
+
+
+============================================================
+5. 系統啟動後實際會發生什麼
+============================================================
+
+1. 使用者執行 `./run.sh`
+2. Streamlit 啟動 `app.py`
+3. 各頁面透過 `utils/init.py` 確保核心物件存在
+4. `ensure_initialization()` 會建立：
+   - `ADBManager`
+   - `DeviceRegistry`
+5. `init_all()` 進一步建立：
+   - `ActionRegistry`
+   - `RoomRegistry`
+   - `SocketServerManager`
+6. `ensure_socket_server_manager()` 會自動巡覽所有房間
+7. 只要某個房間有設定 `socket_ip + socket_port`，就嘗試自動啟動對應的 Node room socket server
+
+也就是說：
+
+房間的 socket server 並不是手動另外執行的常駐 daemon，而是由 Streamlit / Python 這邊作為母進程管理。
+
+
+============================================================
+6. 資料模型與持久化
+============================================================
+
+6.1 設備
+
+設備資料主要由 `core/device.py` 與 `DeviceRegistry` 管理。
+
+一台設備通常會記錄：
+
+- device_id
+- serial
+- ip / port
+- alias / notes
+- status
+- battery / temperature
+- connection_type
+- sort_order
+
+
+6.2 房間
+
+房間資料由 `core/room.py` 與 `RoomRegistry` 管理。
+
+房間除了名稱、說明、設備清單之外，還有幾個很重要的欄位：
+
+- `socket_ip`
+- `socket_port`
+- `saved_user_position_z`
+
+其中 `saved_user_position_z` 是房間層級記憶的共用 z 值，用來做重新進章節 0 / 5 時的使用者位置回寫。
+
+
+6.3 動作
+
+動作是可重複使用的控制模板，例如：
+
+- Wake Up
+- Sleep
+- Keep Awake
+- Launch App
+- Resume App
+- Stop App
+- Restart App
+- Send Key
+- Install APK
+
+
+============================================================
+7. 這個系統的兩條控制通路
+============================================================
+
+理解 QQQuest 最重要的一點，是它不是只有一條通訊路。
+
+它至少有兩條核心通路：
+
+通路 A：Python -> ADB -> Quest
+- 用來做硬體層控制
+- 例如連線、切回遊戲、啟動 App、查焦點、開 scrcpy、抓 logcat
+
+通路 B：Unity client <-> Node room socket server
+- 用來做房間內即時狀態同步
+- 例如 heartbeat、chapter、sequence、focus_state、user_transform_sync
+
+這兩條通路會互相配合，但不是同一件事。
+
+例如：
+
+- 即時狀態表的章節是通路 B 提供的
+- 「切回遊戲」按鈕實際執行是通路 A
+- 自動切回遊戲則是 B 先收到 focus_state，再由 Node server 轉去呼叫 ADB，也就是 B 觸發 A
+
+
+============================================================
+8. Node.js room socket server 的原理
+============================================================
+
+8.1 為什麼每個房間一個 server
+
+這個專案不是用一個中央 message bus，而是每個房間一個 TCP server process。
+
+好處：
+
+- 每個房間狀態彼此隔離
+- 日誌也可按房間拆開
+- 某個房間出錯，不一定影響其他房間
+- 管理端操作比較直觀，房間就是房間，不需要再多做 room namespace
+
+
+8.2 server 啟動方式
+
+`core/socket_server_manager.py` 會執行：
+
+`node servers/room_socket_server.js <room_id> <room_name> <socket_ip> <socket_port>`
+
+並把輸出寫到：
+
+`logs/socket_servers/room_<room_id>_<port>.log`
+
+
+8.3 server 維護哪些狀態
+
+Node server 主要維護：
+
+- `clients`
+  所有 socket 連線
+
+- `players`
+  以 `device_id` 為 key 的玩家狀態
+
+- `autoResumeState`
+  自動切回遊戲的 cooldown 與 in-flight 狀態
+
+- `desiredUserPositionZ`
+  房間記憶的共用 z 值
+
+- `sequenceCounter`
+  sequence 分配計數器
+
+
+8.4 為什麼 server 要自己解析 JSON stream
+
+因為這裡是 raw TCP，不是 HTTP，也不是 WebSocket。
+
+server 端的 parser 會：
+
+- 接收 socket data chunk
+- 把資料累進 buffer
+- 用大括號計數 + 字串狀態判斷切出完整 JSON
+
+這樣即使資料：
+
+- 被拆包
+- 黏包
+- 帶換行
+- 沒有整齊一行一行
+
+仍有機會正確切出 JSON 物件。
+
+
+8.5 server 支援兩套訊息風格
+
+這是本專案很重要的細節。
+
+Unity core protocol 常用：
+- `message_type`
+
+Python admin protocol 常用：
+- `type`
+
+例如：
+
+Unity client 送 heartbeat：
+`{"message_type":"heartbeat", ...}`
+
+Python UI 用 SocketClient 發命令：
+`{"type":"admin_broadcast","data":{...}}`
+
+Node server 在 `handleMessage()` 會先讀：
+
+`message.message_type || message.type`
+
+所以可以同時相容這兩邊。
+
+
+============================================================
+9. Unity client 的原理
+============================================================
+
+9.1 CoPlayerSocketMgr.cs 的定位
+
+`CoPlayerSocketMgr.cs` 是 Quest 端和 room socket server 的主通訊管理器。
+
+它的責任包括：
+
+- 建 TCP 連線
+- 背景 thread 收資料
+- 主執行緒處理訊息
+- 定期送 heartbeat
+- 接 move command / assign sequence
+- 在 focus 變化時通知 server
+- 在特定章節同步使用者位置 transform
+- 接收 server 回送的 z 值調整命令
+
+
+9.2 連線模型
+
+client 端使用 `TcpClient`。
+
+流程：
+
+1. `Start()` -> `InitialData()` -> `StartClient()`
+2. `Connect()` 非同步連到 `serverIP:serverPort`
+3. 連線成功後取得 `NetworkStream`
+4. 啟動接收 thread
+5. `FixedUpdate()` 內定時送 heartbeat
+
+
+9.3 收發資料的 thread 分工
+
+這份 client 沒有直接在背景 thread 改 Unity 物件，而是：
+
+- 背景 thread 只負責從 TCP stream 收資料
+- 把完整 JSON line 丟到 queue
+- 主執行緒在 `DrainReceivedMessagesOnMainThread()` 中處理
+
+這是對的，因為 Unity API 基本上應該在主執行緒操作。
+
+
+9.4 Heartbeat 在做什麼
+
+heartbeat 是 room server 知道 Quest 還活著的主要方式。
+
+目前 heartbeat 會送出：
+
+- device_id
+- chapter
+- message
+- HMD / 手部相關位置資料
+
+server 收到後會更新：
+
+- 玩家最後心跳時間
+- 章節
+- 額外訊息
+- IP 位址
+
+然後回一個 `update` 給 client。
+
+
+9.5 sequence 是什麼
+
+每台 client 連進房間後，可以被指定 sequence。
+
+這個 sequence 目前主要是房間內秩序／座位／多人同步邏輯的一部分，server 會在 `assign_sequence` 訊息中下發，client 端更新 `mySequence`，再廣播 Unity Event。
+
+
+9.6 chapter 是什麼
+
+chapter 是目前遊戲／流程所處的章節編號。
+
+server 可以：
+
+- broadcast 給所有 client
+- unicast 給指定 client
+
+client 收到 `move_command` 後會：
+
+- `OnChapterChange(newChapter)`
+- 觸發 `MoveChapterUEvent`
+- 如果 chapter == 2，觸發 `GameStartUEvent`
+
+也就是說，chapter 2 在目前這份 client 被視為「開始正式流程」的重要節點。
+
+
+9.7 使用者位置同步
+
+root `CoPlayerSocketMgr.cs` 目前有一個 public 欄位：
+
+- `UserPositionTransform`
+
+目前邏輯是：
+
+1. 進入 chapter 0 時，client 送一次 `user_transform_sync`
+2. 進入 chapter 5 時，client 再送一次 `user_transform_sync`
+3. server 記住它的 position / rotation / scale
+4. 房間管理 UI 只顯示 `position.z`
+5. UI 可以送 `user_position_adjust`
+6. client 收到後只更新 `UserPositionTransform.position.z`
+7. client 更新完會再回送一次新的 `user_transform_sync`
+
+這是一條來回閉環。
+
+
+9.8 Focus / pause 通知
+
+`QuestFocusSafeTimeline.cs` 會監聽：
+
+- `OVRManager.InputFocusLost`
+- `OVRManager.InputFocusAcquired`
+- `OnApplicationPause(true/false)`
+
+它做的事情包括：
+
+- input focus lost 時，只關閉指定 input / visual，不一定停掉整個遊戲
+- 真正 app pause 時才 pause timeline / audio
+- resume 時恢復
+- 同步把 focus_state 送給 room server
+
+這樣做的目的，是讓 Quest 誤觸系統層或 Passthrough 時，Unity 端仍能維持比較可控的狀態，並把事件交給 server 做後續處理。
+
+
+============================================================
+10. ADBManager 的原理
+============================================================
+
+`core/adb_manager.py` 是整個硬體控制核心。
+
+它負責幾件大事：
+
+1. ADB 是否安裝可用
+2. 設備列表查詢與快取
+3. 連 Quest / 斷 Quest
+4. 查設備資訊、電量、溫度、屏幕狀態
+5. 啟動 / 停止 App
+6. Resume App
+7. 啟動 scrcpy
+8. Passthrough logcat 監控
+9. 批量執行動作
+
+
+10.1 為什麼需要 ADB 快取
+
+`adb devices` 很常被叫，如果每次 UI render 都完整重跑，會讓頁面變慢。
+
+所以 `ADBManager` 裡有短 TTL cache，降低重複呼叫成本。
+
+
+10.2 為什麼要有 PingService
+
+設備管理頁不是只看 ADB 列表，還會對未連接設備做網路 ping 與自動重連。
+
+這件事如果直接阻塞主執行緒，頁面會卡。
+
+所以專案用了：
+
+- `AutoConnectManager`
+- `PingService`
+
+來把 ping 與自動連接放到背景 thread pool 做。
+
+
+10.3 Resume App 的核心邏輯
+
+這個專案針對 Quest 誤觸 Passthrough / 系統層，做了比較完整的 resume sequence。
+
+核心操作大致是：
+
+1. 先送 BACK
+2. 視情況送 ESCAPE 清 overlay
+3. 用 explicit VR activity 的 `am start`
+4. 再補 `monkey`
+5. 必要時做 fallback rounds
+6. 用 `dumpsys window` / `dumpsys activity` 檢查焦點是否真的回到目標 package
+
+這表示「命令送出」和「畫面真的回來」在這個專案裡是兩回事，程式有額外做驗證。
+
+
+10.4 Passthrough 偵測
+
+除了 Unity 端主動送 `focus_state`，Python 端 ADB 也有另一條偵測：
+
+- `start_passthrough_logcat_monitor()`
+
+它會持續讀：
+
+- `adb -s <device> logcat -v time`
+
+並對關鍵字做比對，例如：
+
+- `com.oculus.os.clearactivity`
+- `com.oculus.vrshell`
+- `ForegroundAppHandler`
+
+一旦判斷像是 Passthrough / 系統 UI 介入，就會在房間管理 UI 的即時狀態旁邊亮紅點。
+
+這條是 ADB / logcat 側的被動偵測，不等於 Unity focus_state。
+
+
+============================================================
+11. 房間管理頁是整個系統的作戰中心
+============================================================
+
+`pages/2_🏠_房間管理.py` 是目前功能最重的一頁。
+
+這一頁同時做了：
+
+- 房間 CRUD
+- 房間內設備管理
+- room socket server 啟停 / 重啟
+- Time Reminder
+- 即時狀態表
+- Passthrough 紅點標記
+- 切回遊戲
+- 使用者位置調整
+- CCTV 監控牆
+- 群控章節切換
+- 單獨切換
+- sequence 管理
+- room socket server log 查看
+- 自訂 socket 命令發送
+
+如果只看使用角度，這頁幾乎是：
+
+「現場操作員真正會一直盯著的一頁」
+
+
+============================================================
+12. 即時狀態表的資料是怎麼來的
+============================================================
+
+這張表不是從 ADB 來的，也不是從 scrcpy 來的。
+
+它的來源是：
+
+1. Streamlit 用 `SocketClient` 連到 room socket server
+2. 發送 `who`
+3. Node server 把目前 `players` map 裡的資料回傳
+4. Python 把它整理成 DataFrame
+
+表格目前主要會顯示：
+
+- device_id
+- alias
+- chapter
+- current_time
+- user_position_z
+
+其中：
+
+- `chapter` 來自 heartbeat
+- `current_time` 是從 heartbeat 的 `message` 字串裡用 regex 抓 `MM:SS`
+- `user_position_z` 是 client 回傳 transform 的 `position.z`
+
+另外，表格還會做簡單異常判斷：
+
+- 章節和大多數人不一致
+- 時間和中位數差超過 4 秒
+
+該列就會被標紅。
+
+
+============================================================
+13. 章節切換與群控的實際流程
+============================================================
+
+13.1 全房間切換章節
+
+房間管理頁按下「切換章節」後：
+
+1. Python `SocketClient` 連上 room socket server
+2. 發 `admin_broadcast`
+3. 內層 payload 是：
+   - `message_type: move_command`
+   - `move_command.chapter`
+   - `move_command.package_name`
+4. Node server 直接 broadcast 給所有 client
+5. 每個 client 收到後執行 `OnChapterChange()`
+
+
+13.2 單台切換章節
+
+流程類似，但改成：
+
+- `admin_unicast`
+- 指定 `target_device_id`
+
+
+13.3 為什麼 chapter 2 會啟動計時
+
+目前房間管理頁的 Time Reminder trigger 是綁在：
+
+- 切到 chapter 2 時，將 `timer_trigger_<room_id>` 更新為當下 timestamp
+
+所以目前邏輯代表：
+
+「流程正式開始」是從 chapter 2 算起。
+
+
+============================================================
+14. Time Reminder 的原理
+============================================================
+
+Time Reminder 是一個嵌入式前端元件，位置在：
+
+- `components/time_reminder.py`
+
+它用 HTML + JS + p5.js 畫面板。
+
+輸入資料來源：
+
+- `time_events.json`
+
+每個事件包含：
+
+- `seconds`
+- `rawTime`
+- `content`
+
+當房間管理頁把 trigger timestamp 更新時，前端元件會重置並開始計時。
+
+這塊本質上是「操作輔助 UI」，不是 Node/Unity 同步核心。
+
+
+============================================================
+15. CCTV 監控牆的原理
+============================================================
+
+按下「CCTV 監控牆 (所有設備)」後：
+
+1. 從房間內找出所有在線設備
+2. `ADBManager.reset_scrcpy_window_layout()`
+3. 依序對每台設備呼叫 `start_quest_single_eye_scrcpy()`
+4. scrcpy 視窗自動九宮格排版
+
+這一段目前的重要特性：
+
+- 視窗位置會依 slot 自動分配，不會全部疊在一起
+- 目前單眼 crop 已暫時註解，因為曾經在排查黑屏與 crop 的關係
+- scrcpy 參數可在系統設定頁調整，如 bitrate、max_size、max_fps、window_width
+
+也就是說，監控牆本質上是：
+
+房間管理頁對 ADBManager 批量呼叫 scrcpy，而不是透過 Node room server。
+
+
+============================================================
+16. 自動切回遊戲的完整鏈路
+============================================================
+
+這條鏈路是本專案最值得理解的一條。
+
+16.1 事件起點
+
+當 Quest 誤觸 Passthrough 或系統層時，Unity 端可能觸發：
+
+- `InputFocusLost`
+- `OnApplicationPause(true)`
+
+`QuestFocusSafeTimeline.cs` 會呼叫：
+
+- `socketMgr.SendFocusState(...)`
+
+
+16.2 Node server 收到 focus_state
+
+room socket server 收到後會：
+
+1. 更新該 player 的 `focus_state`
+2. 判斷是否屬於應該 auto resume 的狀態
+3. 如果是，就進入 `triggerAutoResume()`
+
+
+16.3 Node server 直接用 ADB 打 Quest
+
+這裡很關鍵：
+
+server 不會只是回一個 socket 訊息請 client 自己切回。
+
+它會在 Node process 本機直接執行：
+
+- `adb connect`
+- `adb shell input keyevent KEYCODE_ESCAPE`
+- `adb shell input keyevent 4`
+- `adb shell am start ...`
+- `adb shell monkey ...`
+- `adb shell dumpsys window windows`
+
+所以 auto resume 是：
+
+Unity socket 事件觸發
+  -> Node server 收到
+  -> Node server 本機 ADB 控 Quest
+
+
+16.4 為什麼這件事有時會不穩
+
+因為這條鏈不是單一系統：
+
+1. Unity 要成功送出 focus_state
+2. Node server 要收到
+3. Node server 要推導出正確 ADB target IP
+4. ADB 連線要通
+5. Quest 系統層要願意退
+6. explicit activity / monkey 要成功把 VR activity 帶回來
+7. 焦點檢查要真的變成目標 package
+
+所以 chapter/sequence 正常，並不代表 auto resume 一定穩。
+
+
+16.5 手動切回遊戲按鈕
+
+房間管理即時狀態右側的「切回遊戲」按鈕，實際上不是走 Node server，而是直接走 Python 的 `ADBManager.execute_resume_app()`。
+
+所以它和 auto resume 的共同點是都靠 ADB；
+差別在於：
+
+- auto resume：Node server 主動執行
+- 手動切回：Streamlit/Python 直接執行
+
+
+============================================================
+17. 使用者位置同步的完整鏈路
+============================================================
+
+17.1 Client -> Server
+
+目前 client 在 chapter 0 與 chapter 5 會送：
+
+- `user_transform_sync`
+
+內容包含：
+
+- device_id
+- chapter
+- sequence
+- reason
+- timestamp
+- position
+- rotation
+- scale
+
+
+17.2 Server -> UI
+
+Node server 收到後會把完整 transform 存在 player state，但回給 `who` 時只把：
+
+- `user_position_z`
+
+暴露給 UI。
+
+
+17.3 UI -> Server -> Client
+
+當你在房間管理右側改某台設備的 z 值並按「重新調整位置」時：
+
+1. Python 先把這個 z 存進 room 的 `saved_user_position_z`
+2. 再用 `admin_unicast` 對指定 device 送：
+   - `message_type: user_position_adjust`
+   - `z`
+3. client 收到後只改 `UserPositionTransform.position.z`
+4. client 改完立即再送一次 `user_transform_sync`
+5. UI 重新從 `who` 看到新 z 值
+
+
+17.4 房間層級共用 z 值
+
+房間管理頁另有「共用 z 值 / 批量修改位置」。
+
+它做兩件事：
+
+1. 把 z 存到 `rooms.json`
+2. 同步到 room socket server 的 `desiredUserPositionZ`
+
+之後只要 client 回到：
+
+- chapter 0
+- chapter 5
+
+server 就會自動把記住的 z 值再推回 client。
+
+
+============================================================
+18. 設備管理頁的實際用途
+============================================================
+
+設備管理頁不是單純的設備清單，它還做了很多背景管理工作。
+
+主要功能：
+
+- 新增設備
+- 編輯設備
+- 移除設備
+- 單台執行動作
+- 顯示狀態 / 電量 / 溫度
+- 與 ADB devices 自動同步狀態
+- 對未連線設備做 ping
+- 視設定自動嘗試重新連接 Wi-Fi ADB
+
+這頁是系統的設備入口。
+
+實務上通常是：
+
+先在設備管理把 Quest 都收進來
+  -> 再到房間管理分房間與做群控
+
+
+============================================================
+19. 動作管理頁的實際用途
+============================================================
+
+動作管理頁是把「一組 ADB 行為」模板化。
+
+例如：
+
+- Launch App
+- Resume App
+- Stop App
+- Send Key
+
+這樣房間管理頁執行「房間動作」時，不需要每次手打參數，而是選一個已定義的 Action。
+
+特別值得注意的是：
+
+- `RESUME_APP` 已經被當成 Quest 誤觸後回前景的一種標準動作類型
+
+
+============================================================
+20. 系統設定頁的實際用途
+============================================================
+
+系統設定頁主要在調整整個系統的操作手感。
+
+20.1 scrcpy 設定
+
+可調：
+
+- bitrate
+- max_size
+- max_fps
+- render_driver
+- window_width / height
+- window_x / y
+- stay_awake
+- show_touches
+- fullscreen
+- always_on_top
+- turn_screen_off
+- enable_audio
+
+
+20.2 網路監控設定
+
+可調：
+
+- 是否啟用
+- ping interval
+- ping timeout
+- auto connect
+- max retries
+- cooldown
+- ping 目標策略
+
+
+20.3 匯入 / 匯出
+
+把 `user_config` 匯入匯出，方便備份或複製到另一台管理電腦。
+
+
+============================================================
+21. 重要的網路觀念與常見陷阱
+============================================================
+
+21.1 `0.0.0.0` 是監聽位址，不是 client 應該拿來連的目的位址
+
+這是本專案很容易踩坑的地方。
+
+`0.0.0.0` 的意思是：
+
+- server 在本機所有網卡上監聽
+
+它不是：
+
+- Quest 真正要連的「遠端 IP」
+
+也不是：
+
+- Python 外部 client 一定要拿來 connect 的地址
+
+所以概念上應該分開兩件事：
+
+1. listen/bind IP
+2. advertise/connect IP
+
+目前專案裡這兩個角色有些地方混在一起使用，操作時要特別小心。
+
+
+21.2 `127.0.0.1` 只代表本機
+
+如果 Quest 在另一台裝置上，Quest 連 `127.0.0.1` 只會連到 Quest 自己，不會連到管理電腦。
+
+
+21.3 章節/sequence 正常，不代表自動切回遊戲一定正常
+
+因為：
+
+- 章節/sequence 主要證明 Unity <-> Node socket 通
+- 自動切回遊戲還要再加上 Node -> ADB -> Quest 這條路也通
+
+
+21.4 Python UI 與 Unity core protocol 不完全同構
+
+Python UI 常送：
+
+- `type`
+- `data`
+
+Unity core 常送：
+
+- `message_type`
+- 專屬 payload 欄位
+
+Node server 有幫忙兼容，但開發新功能時一定要分清楚你現在是在寫哪一側。
+
+
+============================================================
+22. 目前這份 client 的一個重要注意事項
+============================================================
+
+Python `execute_launch_app()` 目前會透過 ADB `am start` 傳入：
+
+- `qqquest_server_ip`
+- `qqquest_server_port`
+
+但是就目前 root `CoPlayerSocketMgr.cs` 的程式碼來看，它本身沒有直接讀取 Android Intent extra 的邏輯。
+
+這代表：
+
+1. 如果 Unity 專案裡沒有其他程式負責接這些 extra 並回填 `serverIP/serverPort`
+2. 那實際連線目標仍然可能是 Inspector 上設定的 `serverIP/serverPort`
+
+這一點很重要，因為它會直接影響：
+
+- 為什麼 App 啟動了但沒連到正確 room server
+- 為什麼某些情況外網可用、內網不穩
+
+建議把這件事視為目前架構文件裡需要特別標示的 caveat。
+
+
+============================================================
+23. 常見操作流程
+============================================================
+
+23.1 第一次部署一個新房間
+
+1. 在設備管理頁把所有 Quest 加進來
+2. 確認 Wi-Fi ADB 已通
+3. 在房間管理頁新增房間
+4. 設定房間名稱 / 最大設備數
+5. 設定 `socket_ip` / `socket_port`
+6. 把設備加入房間
+7. 啟動房間 Socket Server
+8. 讓 Quest client 連上該 server
+9. 用 `who` / 即時狀態確認連線正常
+
+
+23.2 正式演出 / 體驗前檢查
+
+1. 設備管理頁確認所有 Quest 在線
+2. 房間管理頁確認 Socket Server 運行中
+3. 即時狀態表確認所有玩家都有 heartbeat
+4. 檢查 chapter / current_time 是否一致
+5. 如需位置同步，確認 chapter 0 / 5 有看到 `使用者位置`
+6. 如需監看，開啟 CCTV 監控牆
+
+
+23.3 誤觸 Passthrough 時
+
+1. 先看即時狀態旁紅點是否亮
+2. 若亮，表示 ADB logcat 偵測到疑似系統 UI
+3. 可先按「切回遊戲」
+4. 若有 room socket server 的 auto resume，也查看 room log 是否已觸發
+
+
+23.4 批量修正位置
+
+1. 在房間管理頁找到「共用 z 值」
+2. 輸入新的 z
+3. 按「批量修改位置」
+4. 目前在線設備會立刻收到
+5. 這個 z 也會被存進 `rooms.json`
+6. 之後 client 再回到 chapter 0 / 5 時，server 也會自動重推
+
+
+============================================================
+24. 常見故障排查
+============================================================
+
+24.1 房間即時狀態查不到玩家
+
+先檢查：
+
+1. room socket server 有沒有啟動
+2. Quest client 的 `serverIP/serverPort` 是否正確
+3. Python UI 所連的 `socket_ip/socket_port` 是否也正確
+4. room log 裡有沒有新的 client connect
+
+
+24.2 sequence / chapter 有，但切回遊戲不穩
+
+這通常表示：
+
+- Unity <-> Node socket 正常
+- 但 Node/Python -> ADB -> Quest 這條不穩
+
+要查：
+
+1. `adb connect` 是否成功
+2. `escape/back` 是否失敗
+3. `explicit vr activity` 是否有執行
+4. 最後 `focus check` 是否真的含目標 package
+
+
+24.3 有聲音但沒畫面
+
+可能原因：
+
+- 遊戲 process 還在，但系統 overlay 沒退
+- `ResumedActivity` 是遊戲，但 top layer 還被 vrshell / panelapp 蓋住
+- monkey / am start 有發，但沒有真正清掉 Quest 系統層
+
+要查：
+
+- `dumpsys window windows`
+- `dumpsys activity activities`
+- room log 裡 auto resume 最後的 focus check
+
+
+24.4 scrcpy 黑屏
+
+排查方向：
+
+1. crop 是否有影響
+2. 同時開很多台是否造成 Quest / host GPU 壓力
+3. scrcpy 參數是否過大
+4. 某些 Quest 是否在 Passthrough / 系統 UI 狀態
+
+目前專案中單眼 crop 是暫時註解掉的，這是之前為了排查黑屏保留下來的決策。
+
+
+24.5 位置沒有自動套用
+
+先確認：
+
+1. 房間 `saved_user_position_z` 是否真的存到了 `rooms.json`
+2. room socket server 啟動時是否拿到 `QQQUEST_USER_POSITION_Z`
+3. client 是否真的進到 chapter 0 或 chapter 5
+4. client 是否有送 `user_transform_sync`
+5. room log 是否出現 `Apply saved user position`
+
+
+============================================================
+25. 建議補圖的位置
+============================================================
+
+以下是我認為最值得加圖的地方。
+
+圖片建議 1：整體架構圖
+位置：第 2 章後面
+內容：
+- Browser / Streamlit / Python
+- ADB / scrcpy
+- Node room socket server
+- Unity client / Quest
+- 標出兩條通路：即時 socket 通路、ADB 控制通路
+
+
+圖片建議 2：房間管理頁總覽截圖
+位置：第 11 章後面
+內容：
+- Socket Server 監控
+- 即時狀態表
+- 切回遊戲按鈕
+- 使用者位置欄
+- 群控面板
+
+
+圖片建議 3：設備管理頁截圖
+位置：第 18 章後面
+內容：
+- 設備卡片
+- 狀態、電量、溫度
+- 新增設備按鈕
+
+
+圖片建議 4：群控章節切換流程圖
+位置：第 13 章後面
+內容：
+- 房間管理頁按鈕
+- Python SocketClient
+- room socket server
+- broadcast move_command
+- Unity client 收到並切章節
+
+
+圖片建議 5：自動切回遊戲流程圖
+位置：第 16 章後面
+內容：
+- Quest focus lost
+- QuestFocusSafeTimeline 送 focus_state
+- Node server 收到
+- Node 觸發 ADB
+- ADB back / am start / monkey
+- focus check
+
+
+圖片建議 6：使用者位置同步流程圖
+位置：第 17 章後面
+內容：
+- client chapter 0/5 送 transform
+- server 記錄 z
+- UI 顯示 z
+- UI 改 z
+- server unicast
+- client 只改 z 並回送 transform
+
+
+圖片建議 7：TCP JSON 訊息格式示意圖
+位置：第 8 章或第 26 章前
+內容：
+- raw TCP stream
+- newline-delimited JSON
+- 拆包 / 黏包
+- parser 怎麼切訊息
+
+
+圖片建議 8：scrcpy 九宮格監看牆截圖
+位置：第 15 章後面
+內容：
+- 多台 Quest 同時監看
+- 視窗自動排版效果
+
+
+============================================================
+26. 建議保留的封包範例
+============================================================
+
+26.1 Unity -> Server heartbeat
+
+{
+  "message_type": "heartbeat",
+  "heartbeat": {
+    "device_id": "xxxxxx",
+    "chapter": 0,
+    "message": "03:19|15:53"
+  }
+}
+
+
+26.2 Server -> Unity update
+
+{
+  "message_type": "update",
+  "player_count": 9,
+  "timestamp": 1711111111111
+}
+
+
+26.3 Python -> Server broadcast chapter
+
+{
+  "type": "admin_broadcast",
+  "data": {
+    "message_type": "move_command",
+    "move_command": {
+      "chapter": 2,
+      "package_name": "com.Awespire.OrientalBeauty"
+    }
+  }
+}
+
+
+26.4 Unity -> Server focus state
+
+{
+  "message_type": "focus_state",
+  "focus_state": {
+    "device_id": "xxxxxx",
+    "event_name": "input_focus_lost",
+    "has_input_focus": false,
+    "app_paused": false,
+    "chapter": 5,
+    "sequence": 3
+  }
+}
+
+
+26.5 Unity -> Server user transform
+
+{
+  "message_type": "user_transform_sync",
+  "user_transform_sync": {
+    "device_id": "xxxxxx",
+    "chapter": 5,
+    "sequence": 3,
+    "reason": "chapter_5_enter",
+    "position": { "x": 0, "y": 0, "z": 1.23 },
+    "rotation": { "x": 0, "y": 0, "z": 0 },
+    "scale": { "x": 1, "y": 1, "z": 1 }
+  }
+}
+
+
+26.6 Server -> Unity user_position_adjust
+
+{
+  "message_type": "user_position_adjust",
+  "user_position_adjust": {
+    "device_id": "xxxxxx",
+    "z": 1.55,
+    "timestamp": 1711111111111
+  }
+}
+
+
+============================================================
+27. 哪些地方還需要你補業務語意
+============================================================
+
+從程式碼可以看出機制，但有些功能的「業務目的」不是完全能從 code 推論出來。
+
+目前最需要你補一句背景說明的地方有：
+
+1. `height_calibration`
+   程式上看得出是調整三個物件的高度，但業務上這三個物件分別代表什麼、在什麼流程使用，程式本身沒有講
+
+2. `realWorldPlayerLocateMgr.AddtionalMsg`
+   即時狀態中的 `current_time` 目前是從 heartbeat.message 文字解析出來的，但你希望它實際代表什麼時間意義，需要產品端定義
+
+3. `chapter` 編號的業務定義
+   程式上知道 chapter 0 與 5 牽涉位置同步、chapter 2 牽涉開始計時，但每個章節在體驗流程中代表什麼，最好由你補一張表
+
+如果未來要把這份文件升級成正式交接文件，最值得補的就是這三塊。
+
+
+============================================================
+28. 最後的總結
+============================================================
+
+QQQuest 不是單一技術的專案，而是四套機制疊在一起：
+
+1. Streamlit 頁面提供操作入口
+2. Python ADBManager 直接控制 Quest
+3. Node.js room socket server 維持房間即時狀態
+4. Unity client 持續送 heartbeat 與接收控制命令
+
+如果要一句話記住它：
+
+它是一個把「設備管理」、「房間群控」、「Quest 即時狀態同步」、「ADB 硬體控制」、「監看牆」、「Passthrough 補救」、「使用者位置同步」全部揉在一起的現場控制系統。
+
+理解這個專案時，最重要的不是每個按鈕的名字，而是每次操作時，你要先知道：
+
+- 這一步是走 Python/ADB？
+- 還是走 Node/Socket？
+- 還是兩者串接？
+
+只要把這三件事分清楚，整個系統就會突然變得很好懂。
+
