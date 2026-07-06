@@ -15,12 +15,36 @@ from core.room import Room
 from core.room_registry import RoomRegistry
 from config.constants import DeviceStatus, STATUS_ICONS
 from utils.logger import get_logger
+from utils.app_picker import app_override_dropdown, apply_package_override
 
 logger = get_logger(__name__)
 
 DEFAULT_GAME_PACKAGE = "com.Awespire.OrientalBeauty"
 STATUS_TABLE_ROW_HEIGHT = 42
 USER_POSITION_SYNC_CHAPTER = 5
+
+# Socket 玩家 device_id 片段 → 別名 (10x) 對照表（單一真實來源）
+# socket `who` 回傳的 device_id 是 6 碼 hex（如 "d5d6cd"），不會對應到 registry 的 device_xxxx，
+# 故此處集中維護目前 6 台設備的別名對照。
+DEVICE_ALIAS_MAP = {
+    "d5d6cd": "106",
+    "9b5bc9": "105",
+    "485278": "104",
+    "ae81fa": "102",
+    "51c6d5": "103",
+    "3848a6": "101",
+}
+
+
+def resolve_device_alias(device_id) -> str:
+    """根據 device_id 片段回傳別名 (10x)；找不到則回傳空字串。"""
+    if not device_id:
+        return ""
+    p_id_lower = str(device_id).lower()
+    for fragment, alias in DEVICE_ALIAS_MAP.items():
+        if fragment in p_id_lower:
+            return alias
+    return ""
 
 # 頁面配置
 st.set_page_config(
@@ -305,6 +329,20 @@ def coerce_optional_float(value) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def chapter_for_display(chapter):
+    """修正即時狀態顯示用的章節編號。
+
+    裝置回報的章節在超過 1 之後會多算 1（例如實際第 2 章會顯示成 3）。
+    這裡只調整「顯示」的數字，不更動 status_data 內供邏輯使用的原始 chapter
+    （例如第 5 章的位置同步判斷）。
+    """
+    try:
+        value = int(chapter)
+    except (TypeError, ValueError):
+        return chapter
+    return value - 1 if value > 1 else value
 
 
 def sync_user_position_input_state(room_id: str, device_id: str, current_z: Optional[float]) -> str:
@@ -1392,16 +1430,20 @@ def execute_action_on_room_dialog(room: Room):
             for key, value in selected_action.params.items():
                 if value:
                     st.text(f"  {key}: {value}")
-    
+
+    # App 類動作：執行時可選擇要操作的應用（覆蓋動作預設 package，不改存檔）
+    pkg_override = app_override_dropdown(selected_action, key=f"room_exec_app_{room.room_id}")
+
     st.markdown("---")
-    
+
     # 執行按鈕
     col1, col2 = st.columns(2)
-    
+
     with col1:
         if st.button("▶️ 執行", type="primary", use_container_width=True):
             # 準備設備列表
             device_list = [device.connection_string for device in online_devices]
+            exec_action = apply_package_override(selected_action, pkg_override)
             
             # 創建進度顯示
             progress_placeholder = st.empty()
@@ -1447,10 +1489,10 @@ def execute_action_on_room_dialog(room: Room):
                     }
                 room_info['device_params_map'] = device_params_map
                 
-                # 使用並發方法執行
+                # 使用並發方法執行（套用本次選擇的應用）
                 batch_results = st.session_state.adb_manager.execute_action_batch(
                     device_list,
-                    selected_action,
+                    exec_action,
                     progress_callback=update_progress,
                     room_info=room_info
                 )
@@ -1869,12 +1911,15 @@ def execute_device_action_dialog(device, room: Optional[Room] = None):
             for key, value in selected_action.params.items():
                 if value:
                     st.text(f"  {key}: {value}")
-    
+
+    # App 類動作：執行時可選擇要操作的應用（覆蓋動作預設 package，不改存檔）
+    pkg_override = app_override_dropdown(selected_action, key=f"dev_exec_app_{device.device_id}")
+
     st.markdown("---")
-    
+
     # 執行按鈕
     col1, col2 = st.columns(2)
-    
+
     with col1:
         if st.button("▶️ 執行", type="primary", use_container_width=True):
             with st.spinner("執行中..."):
@@ -1885,11 +1930,12 @@ def execute_device_action_dialog(device, room: Optional[Room] = None):
                         'socket_ip': room.socket_ip,
                         'socket_port': room.socket_port
                     }
-                
-                # 執行動作
+
+                # 執行動作（套用本次選擇的應用）
+                exec_action = apply_package_override(selected_action, pkg_override)
                 success, message = st.session_state.adb_manager.execute_action(
                     device.connection_string,
-                    selected_action,
+                    exec_action,
                     room_info=room_info
                 )
                 
@@ -1973,24 +2019,9 @@ def render_realtime_status_content(room: Room, events, editable: bool = True, ed
                         elif address:
                             adb_target = address if ":" in address else f"{address}:5555"
 
-                        if "ebb89c" in p_id:
-                            current_alias = "OB6"
-                        elif "a5aaf9" in p_id:
-                            current_alias = "OB7"
-                        elif "f14b0e" in p_id:
-                            current_alias = "OB5"
-                        elif "640596" in p_id:
-                            current_alias = "OB4"
-                        elif "4b5c31" in p_id:
-                            current_alias = "OB8"
-                        elif "2ed155" in p_id:
-                            current_alias = "OB9"
-                        elif "af5776" in p_id:
-                            current_alias = "OB2"
-                        elif "03022c" in p_id:
-                            current_alias = "OB3"
-                        elif "d18452" in p_id:
-                            current_alias = "OB10"
+                        resolved_alias = resolve_device_alias(p_id)
+                        if resolved_alias:
+                            current_alias = resolved_alias
 
                         status_data.append({
                             "device_id": p_id,
@@ -2044,6 +2075,10 @@ def render_realtime_status_content(room: Room, events, editable: bool = True, ed
                             d['is_error'] = is_error
 
                         df = pd.DataFrame(status_data)
+                        # 顯示用修正：超過 1 的章節會被多算 1，僅修正表格顯示，
+                        # 不影響 status_data 內供邏輯使用的原始 chapter。
+                        if 'chapter' in df.columns:
+                            df['chapter'] = df['chapter'].apply(chapter_for_display)
 
                         def highlight_warning(row):
                             if row.get('is_error'):
@@ -2179,7 +2214,8 @@ def render_realtime_status_actions(room: Room):
                     'overlay_clear_back_count': 0,
                     'focus_fallback_rounds': 2,
                     'focus_fallback_back_count': 1,
-                    'focus_fallback_escape_count': 1
+                    'focus_fallback_escape_count': 1,
+                    'force_stop_vrshell_if_panel_overlay': True
                 }
             )
             if success_resume:
@@ -2254,6 +2290,96 @@ def render_realtime_status_fragment(room: Room, events):
 def render_realtime_status_markers_fragment(room: Room):
     """局部自動刷新 Passthrough 紅色標記，不重建按鈕。"""
     render_realtime_status_markers(room)
+
+
+def get_sound_device_display(device_id):
+    """聲音觸發用的設備顯示名稱：優先別名 (10x)，找不到才退回 device id。"""
+    alias = resolve_device_alias(device_id)
+    if alias:
+        return alias
+    if 'device_registry' in st.session_state:
+        device = st.session_state.device_registry.get_device(device_id)
+        if device:
+            if device.alias:
+                return device.alias
+            if device.notes:
+                return device.notes
+    return device_id
+
+
+def send_play_sound_command(room: Room, target_device_ids, sound_index: int):
+    """對指定設備各發送一次 play_sound（帶 sound_index）。回傳 (成功數, 失敗訊息list)。"""
+    from core.socket_client import SocketClient
+    ok_count = 0
+    fails = []
+    try:
+        with SocketClient(room.socket_ip, room.socket_port) as client:
+            for dev_id in target_device_ids:
+                # Payload: { type:'admin_unicast', data:{ target_device_id, data:{ message_type:'play_sound', sound_index } } }
+                payload = {
+                    "target_device_id": dev_id,
+                    "data": {
+                        "message_type": "play_sound",
+                        "device_id": dev_id,
+                        "sound_index": sound_index
+                    }
+                }
+                ok, resp = client.send_command("admin_unicast", payload)
+                if ok and resp.get("success"):
+                    ok_count += 1
+                else:
+                    fails.append(f"{get_sound_device_display(dev_id)}: {resp.get('message', '未知錯誤')}")
+    except Exception as e:
+        fails.append(f"連接失敗: {e}")
+    return ok_count, fails
+
+
+@st.fragment(run_every="1s")
+def render_sound_trigger_buttons(room: Room, sound_device_ids):
+    """兩顆提示按鈕：按下其中一顆後，在冷卻時間內把『另一顆』鎖住，避免誤觸。
+    用 run_every 局部刷新，冷卻結束會自動解鎖（不需手動互動）。"""
+    import time
+
+    busy_key = f"sound_busy_until_{room.room_id}"
+    active_key = f"sound_active_idx_{room.room_id}"
+    cooldown = float(st.session_state.get(f"sound_cooldown_{room.room_id}", 3.0))
+
+    now = time.time()
+    busy_until = float(st.session_state.get(busy_key, 0.0))
+    active_idx = int(st.session_state.get(active_key, -1))
+    busy = now < busy_until
+    remain = max(0.0, busy_until - now)
+
+    # 從 checkbox 的 session_state 取目前勾選的設備（fragment 自刷時也能拿到最新勾選）
+    selected = [d for d in sound_device_ids if st.session_state.get(f"sound_cb_{room.room_id}_{d}")]
+
+    def fire(idx, label):
+        if not selected:
+            st.toast("⚠️ 請至少勾選一台設備", icon="⚠️")
+            return
+        # 先鎖定，再送指令；之後局部 rerun 立即把另一顆變灰
+        st.session_state[busy_key] = time.time() + cooldown
+        st.session_state[active_key] = idx
+        ok_count, fails = send_play_sound_command(room, selected, idx)
+        if ok_count > 0:
+            st.toast(f"✅ 已發送{label}（{ok_count} 台）")
+        if fails:
+            st.toast("❌ 部分失敗：" + "；".join(fails), icon="⚠️")
+        st.rerun(scope="fragment")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        lock0 = busy and active_idx != 0
+        label0 = f"🔒 提示1（{remain:.0f}s）" if lock0 else "🔊 發送提示1"
+        if st.button(label0, type="primary", width="stretch", disabled=lock0,
+                     key=f"btn_send_sound1_{room.room_id}"):
+            fire(0, "提示1")
+    with col2:
+        lock1 = busy and active_idx != 1
+        label1 = f"🔒 提示2（{remain:.0f}s）" if lock1 else "🔊 發送提示2"
+        if st.button(label1, type="primary", width="stretch", disabled=lock1,
+                     key=f"btn_send_sound2_{room.room_id}"):
+            fire(1, "提示2")
 
 
 @st.dialog("🏠 房間視圖", width="large")
@@ -2542,28 +2668,11 @@ def room_view_dialog(room: Room):
                                 elif address:
                                     adb_target = address if ":" in address else f"{address}:5555"
                                 
-                                # Hardcode alias for specific device
-                                if "ebb89c" in p_id:
-                                    current_alias = "OB6"
-                                elif "a5aaf9" in p_id:
-                                    current_alias = "OB7"
-                                elif "f14b0e" in p_id:
-                                    current_alias = "OB5"
-                                elif "640596" in p_id:
-                                    current_alias = "OB4"
-                                elif "4b5c31" in p_id:
-                                    current_alias = "OB8"
-                                elif "2ed155" in p_id:
-                                    current_alias = "OB9"
-                                elif "af5776" in p_id:
-                                    current_alias = "OB2"
-                                elif "03022c" in p_id:
-                                    current_alias = "OB3"
-                                elif "d18452" in p_id:
-                                    current_alias = "OB10"
-                                    # Ensure it's saved in registry execution flow if needed? 
-                                    # But here we just display it. The edit flow might override it if we don't handle it there.
-                                
+                                # 用統一的別名對照表覆寫 (10x)
+                                resolved_alias = resolve_device_alias(p_id)
+                                if resolved_alias:
+                                    current_alias = resolved_alias
+
                                 status_data.append({
                                     "device_id": p_id,
                                     "registry_device_id": device_obj.device_id if device_obj else "",
@@ -2669,7 +2778,7 @@ def room_view_dialog(room: Room):
                                             )
                                             passthrough_alert = st.session_state.adb_manager.get_passthrough_alert(adb_target)
 
-                                        button_help = f"先送 BACK，再用 monkey 將 {DEFAULT_GAME_PACKAGE} 帶回前景"
+                                        button_help = f"先送 BACK，再用 explicit VR activity/monkey 將 {DEFAULT_GAME_PACKAGE} 帶回前景，並檢查 Quest 畫面焦點"
                                         if passthrough_alert:
                                             button_help = f"偵測到可能誤觸 Passthrough：{passthrough_alert.get('reason', '系統 UI 接管')}"
 
@@ -2691,7 +2800,15 @@ def room_view_dialog(room: Room):
                                                     'send_back_first': True,
                                                     'back_count': 2,
                                                     'explicit_activity_first': True,
-                                                    'am_start_after': True
+                                                    'am_start_after': True,
+                                                    'verify_focus': True,
+                                                    'send_escape_if_overlay': True,
+                                                    'overlay_clear_escape_count': 1,
+                                                    'overlay_clear_back_count': 0,
+                                                    'focus_fallback_rounds': 2,
+                                                    'focus_fallback_back_count': 1,
+                                                    'focus_fallback_escape_count': 1,
+                                                    'force_stop_vrshell_if_panel_overlay': True
                                                 }
                                             )
                                             if success_resume:
@@ -2899,19 +3016,8 @@ def room_view_dialog(room: Room):
                         # Reuse logic or simplified version
                         # Ideally we reuse the get_device_display from below but scope is different
                         # Let's duplicate simple lookup for now or rely on registry
-                         # Hardcode alias for specific device (reuse same logic as sequence)
-                        p_id = device_id
-                        current_alias = ""
-                        if "ebb89c" in p_id: current_alias = "OB6"
-                        elif "a5aaf9" in p_id: current_alias = "OB7"
-                        elif "f14b0e" in p_id: current_alias = "OB5"
-                        elif "640596" in p_id: current_alias = "OB4"
-                        elif "4b5c31" in p_id: current_alias = "OB8"
-                        elif "2ed155" in p_id: current_alias = "OB9"
-                        elif "af5776" in p_id: current_alias = "OB2"
-                        elif "03022c" in p_id: current_alias = "OB3"
-                        elif "d18452" in p_id: current_alias = "OB10"
-                
+                        # 統一別名對照表 (10x)
+                        current_alias = resolve_device_alias(device_id)
                         if current_alias:
                             return f"{current_alias} ({device_id})"
 
@@ -2959,12 +3065,7 @@ def room_view_dialog(room: Room):
                                 
                                         if success and response.get("success"):
                                             st.success(f"✅ 已對 {target_move_device} 切換至 Ch. {target_chapter}")
-                                            if int(target_chapter) == 2:
-                                                import time
-                                                trigger_key = f"timer_trigger_{room.room_id}"
-                                                st.session_state[trigger_key] = time.time()
-                                                st.toast("⏱️ 時間提醒已重置並開始！")
-                                                st.rerun()
+                                            # 單獨切換不重置時間提醒（只有全體切換才重置）
                                         else:
                                             st.error(f"❌ 切換失敗: {response.get('message', '未知錯誤')}")
                                 except Exception as e:
@@ -3010,14 +3111,14 @@ def room_view_dialog(room: Room):
                                             p_id_lower = dev_id.lower()
                                     
                                             # Hardcoded mapping from user request
-                                            if "ebb89c" in p_id_lower: alias = "OB6"
-                                            elif "a5aaf9" in p_id_lower: alias = "OB7"
-                                            elif "f14b0e" in p_id_lower: alias = "OB5"
-                                            elif "640596" in p_id_lower: alias = "OB4"
-                                            elif "4b5c31" in p_id_lower: alias = "OB8"
-                                            elif "2ed155" in p_id_lower: alias = "OB9"
-                                            elif "af5776" in p_id_lower: alias = "OB2"
-                                            elif "03022c" in p_id_lower: alias = "OB3"
+                                            # if "d5d6cd" in p_id_lower: alias = "OB6"
+                                            if "9b5bc9" in p_id_lower: alias = "OB5"
+                                            # elif "485278" in p_id_lower: alias = "OB4"
+                                            # elif "ae81fa" in p_id_lower: alias = "OB2"
+                                            # elif "51c6d5" in p_id_lower: alias = "OB3"
+                                            # elif "af5776" in p_id_lower: alias = "OB1"
+
+                                            
                                     
                                             # Fallback to Registry Alias if not found in hardcoded
                                             if not alias and 'device_registry' in st.session_state:
@@ -3037,7 +3138,7 @@ def room_view_dialog(room: Room):
                                                         # User rule: OB6 -> 5, OB9 -> 0
                                                         # 6-1 = 5 % 8 = 5.
                                                         # 9-1 = 8 % 8 = 0.
-                                                        seq_num = (num - 1) % 8
+                                                        seq_num = (num - 1) % 6
                                                 except:
                                                     pass
                                     
@@ -3101,26 +3202,8 @@ def room_view_dialog(room: Room):
             
                     # Format function for device display
                     def get_device_display(device_id):
-                        # Hardcode alias for specific device
-                        p_id = device_id
-                        current_alias = ""
-                        if "ebb89c" in p_id:
-                            current_alias = "OB6"
-                        elif "a5aaf9" in p_id:
-                            current_alias = "OB7"
-                        elif "f14b0e" in p_id:
-                            current_alias = "OB5"
-                        elif "640596" in p_id:
-                            current_alias = "OB4"
-                        elif "4b5c31" in p_id:
-                            current_alias = "OB8"
-                        elif "2ed155" in p_id:
-                            current_alias = "OB9"
-                        elif "af5776" in p_id:
-                            current_alias = "OB2"
-                        elif "03022c" in p_id:
-                            current_alias = "OB3"
-                
+                        # 統一別名對照表 (10x)
+                        current_alias = resolve_device_alias(device_id)
                         if current_alias:
                             return f"{current_alias} ({device_id})"
 
@@ -3221,8 +3304,12 @@ def room_view_dialog(room: Room):
                                      cols_to_show = [c for c in ["sequence", "device_id", "chapter", "message", "address", "last_heartbeat"] if c in df.columns]
                                      
                                      df_display = df[cols_to_show].rename(columns=cols_map)
-                                     
-                                     # Format timestamp if needed? 
+
+                                     # 顯示用修正：超過 1 的章節會被多算 1，僅修正顯示。
+                                     if "Chapter" in df_display.columns:
+                                         df_display["Chapter"] = df_display["Chapter"].apply(chapter_for_display)
+
+                                     # Format timestamp if needed?
                                      # timestamp is often epoch ms.
                                      if "Last Heartbeat" in df_display.columns:
                                          df_display["Last Heartbeat"] = pd.to_datetime(df_display["Last Heartbeat"], unit='ms').dt.strftime('%H:%M:%S')
@@ -3234,6 +3321,66 @@ def room_view_dialog(room: Room):
                                  st.warning("無法獲取玩家狀態")
                     except Exception as e:
                         st.error(f"錯: {e}")
+
+            # --- 聲音觸發 + 背景音樂：兩個方框並列（參考 章節切換 / 序列管理 排版）---
+            st.divider()
+            col_sound, col_bgm = st.columns(2)
+
+            with col_sound:
+                with st.container(height=420, border=True, key=f"qqquest-control-card-sound-{room.room_id}"):
+                    st.markdown("#### 🔊 聲音觸發 (Sound Trigger)")
+                    st.caption("勾選要播放音效的 Quest，再按「發送提示1 / 發送提示2」會各播放 SoundTrigger 清單中的第 1 / 第 2 個音效。")
+
+                    # 取得線上設備
+                    sound_online_players = []
+                    if socket_running:
+                        from core.socket_client import SocketClient
+                        try:
+                            with SocketClient(room.socket_ip, room.socket_port) as client:
+                                s_ok, s_resp = client.send_command("who")
+                                if s_ok and "players" in s_resp:
+                                    sound_online_players = s_resp["players"]
+                        except Exception:
+                            pass
+
+                    if not socket_running:
+                        st.error("❌ Socket Server 未運行")
+                    elif not sound_online_players:
+                        st.info("暫無玩家連接")
+                    else:
+                        sound_device_ids = [p["device_id"] for p in sound_online_players]
+                        sound_cols = st.columns(2)
+                        for idx, dev_id in enumerate(sound_device_ids):
+                            with sound_cols[idx % 2]:
+                                st.checkbox(
+                                    get_sound_device_display(dev_id),
+                                    key=f"sound_cb_{room.room_id}_{dev_id}"
+                                )
+
+                        st.number_input(
+                            "提示音長度（秒）",
+                            min_value=0.5,
+                            max_value=30.0,
+                            value=3.0,
+                            step=0.5,
+                            key=f"sound_cooldown_{room.room_id}",
+                            help="按下提示後，這段時間內『另一顆』按鈕會被鎖住，避免誤觸。設成約等於你提示音的長度即可。"
+                        )
+
+                        # 兩顆按鈕用獨立 fragment：按下後鎖住另一顆，冷卻結束自動解鎖
+                        render_sound_trigger_buttons(room, sound_device_ids)
+
+            with col_bgm:
+                with st.container(height=420, border=True, key=f"qqquest-control-card-bgm-{room.room_id}"):
+                    st.markdown("#### 🎵 背景音樂 (BGM)")
+                    st.caption("按「開始」會淡入播放 bgm 資料夾中的 mp3 並循環；「暫停」會淡出。音樂在控制端瀏覽器播放，與 Quest 無關。")
+                    from components.bgm_player import list_bgm_tracks, bgm_player_component, default_bgm_dir
+                    bgm_dir = default_bgm_dir()
+                    bgm_tracks = list_bgm_tracks(bgm_dir)
+                    if not bgm_tracks:
+                        st.info(f"📂 bgm 資料夾目前沒有 mp3，請把音樂放到：`{bgm_dir}`")
+                    else:
+                        bgm_player_component(bgm_tracks, height=300)
 
         with tab2:
             # 日誌視窗
@@ -3561,17 +3708,37 @@ def load_time_events(file_path=TIME_EVENTS_FILE):
                 if len(parts) == 2:
                     seconds = int(parts[0]) * 60 + int(parts[1])
                 elif len(parts) == 3:
-                     seconds = int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+                    # Times are stored as MM:SS; a spurious trailing ":00" makes them
+                    # look like HH:MM:SS (e.g. "07:22:00" means 7m22s = 442s, not 7h).
+                    # Treat the first two fields as MM:SS and ignore the trailing field.
+                    seconds = int(parts[0]) * 60 + int(parts[1])
                 elif raw_time.isdigit():
                     seconds = int(raw_time)
             except:
                 pass
             
+            # 解析每泡奉茶的提醒分鐘點（可多個）。支援字串 "7,6,5" / 全形逗號 / list。
+            remind_raw = ev.get('remind_mins', '')
+            remind_mins = []
+            if isinstance(remind_raw, list):
+                parts = remind_raw
+            else:
+                parts = str(remind_raw).replace('，', ',').split(',')
+            for p in parts:
+                p = str(p).strip()
+                if not p:
+                    continue
+                try:
+                    remind_mins.append(float(p))
+                except ValueError:
+                    pass
+
             if seconds >= 0:
                 events.append({
                     "seconds": seconds,
                     "rawTime": raw_time,
-                    "content": content
+                    "content": content,
+                    "remindMins": remind_mins
                 })
         
         events.sort(key=lambda x: x['seconds'])
@@ -3589,8 +3756,13 @@ def save_time_events(df_data):
         for _, row in df_data.iterrows():
             t = str(row.get('time', '')).strip()
             c = str(row.get('content', '')).strip()
+            rm_val = row.get('remind_mins', '')
+            rm = '' if pd.isna(rm_val) else str(rm_val).strip()
             if t:
-                events.append({'time': t, 'content': c})
+                ev = {'time': t, 'content': c}
+                if rm:
+                    ev['remind_mins'] = rm
+                events.append(ev)
         
         with open(TIME_EVENTS_FILE, 'w', encoding='utf-8') as f:
             json.dump(events, f, indent=2, ensure_ascii=False)
@@ -3612,16 +3784,37 @@ def render_time_config():
         # Create DataFrame for editor
         df = pd.DataFrame(data)
         if df.empty:
-            df = pd.DataFrame(columns=["time", "content"])
-            
+            df = pd.DataFrame(columns=["time", "content", "remind_mins"])
+
+        # 確保有 remind_mins 欄；奉茶且未填者預設 7（讓使用者看到並可改）
+        if "remind_mins" not in df.columns:
+            df["remind_mins"] = ""
+        df["remind_mins"] = df["remind_mins"].fillna("").astype(str)
+
+        def _default_remind(r):
+            rm = str(r.get("remind_mins", "") or "").strip()
+            if rm and rm.lower() != "nan":
+                return rm
+            return "7" if "奉茶" in str(r.get("content", "")) else ""
+        if not df.empty:
+            df["remind_mins"] = df.apply(_default_remind, axis=1)
+
         edited_df = st.data_editor(
             df,
             column_config={
                 "time": st.column_config.TextColumn("時間 (MM:SS)", help="例如 05:30 或 120", required=True),
-                "content": st.column_config.TextColumn("內容", help="提示文字", required=True)
+                "content": st.column_config.TextColumn("內容", help="提示文字", required=True),
+                "remind_mins": st.column_config.TextColumn(
+                    "提醒(分)",
+                    help="僅『奉茶』適用。要提前幾分鐘提醒，可多個用逗號分隔，例如 7,6,5。"
+                         "倒數每到該分鐘會閃紅並顯示「請提醒製茶師時間!!」約 10 秒。"
+                         "奉茶列留空＝沿用預設 7 分鐘。",
+                    required=False
+                )
             },
             num_rows="dynamic",
             use_container_width=True,
+            column_order=["time", "content", "remind_mins"],
             key="time_config_editor"
         )
         

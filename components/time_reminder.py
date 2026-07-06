@@ -54,7 +54,23 @@ def time_reminder_component(events, trigger_ts=0):
     tr:hover td {{ background: #353947; }}
     .muted {{ color: var(--muted); font-size: 12px; text-align: center; margin: 4px 0; }}
     .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }}
-    
+    .tea-countdowns {{ margin-top: 10px; display: flex; flex-direction: column; gap: 4px; align-items: center; }}
+    .tea-row {{ font-size: 14px; color: var(--text); }}
+    .tea-remain {{ color: var(--idle-text); }}
+    .tea-row.tea-alert {{ color: #ff4d4d; font-weight: 700; animation: teaFlash 0.7s ease-in-out infinite; }}
+    .tea-row.tea-alert .tea-remain {{ color: #ff4d4d; }}
+    .tea-remind {{ display: none; margin-left: 12px; color: #ff4d4d; font-weight: 800; }}
+    .tea-row.tea-alert .tea-remind {{ display: inline; }}
+    @keyframes teaFlash {{
+      0%, 100% {{ opacity: 1; }}
+      50% {{ opacity: 0.35; }}
+    }}
+    @keyframes flashRed {{
+      0%, 100% {{ color: var(--text); background: transparent; }}
+      50% {{ color: #ff5a5a; background: rgba(255, 70, 70, 0.22); }}
+    }}
+    .flash-red {{ animation: flashRed 0.8s ease-in-out infinite; border-radius: 6px; font-weight: 700; }}
+
     /* Scrollbar */
     ::-webkit-scrollbar {{ width: 8px; }}
     ::-webkit-scrollbar-track {{ background: #2a2d36; }}
@@ -77,6 +93,7 @@ def time_reminder_component(events, trigger_ts=0):
       <div class="card" style="display:flex; flex-direction:column; justify-content:center;">
         <div id="canvasMount"></div>
         <p class="muted">事件前 5 秒提醒，維持 15 秒。</p>
+        <div id="teaCountdowns" class="tea-countdowns"></div>
       </div>
       <div class="card">
         <h4 style="margin:0 0 8px;">事件清單</h4>
@@ -109,6 +126,25 @@ def time_reminder_component(events, trigger_ts=0):
     const IDLE_COLOR = [38, 40, 49];
     const ALERT_COLOR = [43, 46, 56];
     const ACTIVE_COLOR = [49, 53, 64];
+
+    // Events whose content mentions 奉茶 — shown as countdowns in the left panel.
+    const teaEvents = events.filter(ev => (ev.content || '').indexOf('奉茶') !== -1);
+
+    // Red alert: flashes for 10s starting AT the event time, i.e. [ev, ev+10s].
+    const RED_WINDOW = 10;
+    // 奉茶提醒：每到設定的「分鐘點」就閃紅+文字提醒，維持這麼多秒。
+    const TEA_REMIND_DURATION = 10;
+    // 沒有特別設定提醒分鐘時的預設（分鐘）。
+    const TEA_DEFAULT_REMIND_MIN = 7;
+    let redActive = false;   // set each frame in draw()
+    let redPulse = 0;        // 0..1 blink, set each frame in draw()
+
+    function fmtMMSS(totalSeconds) {{
+      const s = Math.max(0, Math.floor(totalSeconds));
+      const mm = String(Math.floor(s / 60)).padStart(2, '0');
+      const ss = String(s % 60).padStart(2, '0');
+      return mm + ':' + ss;
+    }}
 
     // Check for trigger update
     // We store the last trigger in localStorage to persist across re-renders if needed, 
@@ -160,8 +196,9 @@ def time_reminder_component(events, trigger_ts=0):
       document.getElementById('btnReset').onclick = () => {{ timer = 0; running = false; updateStatusTag('Idle'); }};
       
       renderEventsTable();
+      renderTeaCountdowns();
       updateStatusTag('Idle');
-      
+
       checkAutoStart();
     }}
 
@@ -172,6 +209,13 @@ def time_reminder_component(events, trigger_ts=0):
       if (running) timer += dt;
 
       const state = computeState(timer);
+
+      // Red alert window: |timer - event time| <= 5s
+      redActive = false;
+      for (const ev of events) {{
+        if (timer >= ev.seconds && timer - ev.seconds <= RED_WINDOW) {{ redActive = true; break; }}
+      }}
+      redPulse = (sin(frameCount * 0.25) * 0.5 + 0.5);
 
       // BG
       let bg = IDLE_COLOR;
@@ -189,25 +233,36 @@ def time_reminder_component(events, trigger_ts=0):
       // Top Bar
       stroke(78, 82, 97);
       strokeWeight(1.5);
-      fill(48, 51, 64);
+      fill(redActive ? 60 + redPulse * 20 : 48, redActive ? 40 : 51, redActive ? 44 : 64);
       rect(10, 10, width - 20, 50, 8);
+      // Flashing red border when within ±5s of an event
+      if (redActive) {{
+        noFill();
+        stroke(255, 70, 70, 120 + redPulse * 135);
+        strokeWeight(2 + redPulse * 2.5);
+        rect(10, 10, width - 20, 50, 8);
+      }}
 
       // Time
       noStroke();
-      fill(214 + pulse * 18, 218 + pulse * 16, 229 + pulse * 12);
+      if (redActive) {{
+        fill(255, 90 + redPulse * 60, 90 + redPulse * 60);
+      }} else {{
+        fill(214 + pulse * 18, 218 + pulse * 16, 229 + pulse * 12);
+      }}
       textSize(24);
       textAlign(LEFT, CENTER);
-      text(Math.floor(timer) + 's', 20, 35);
-      
+      text(fmtMMSS(timer), 20, 35);
+
       textSize(14);
-      fill(textMuted);
-      const modeText = state.mode === 'alert' ? '提醒中' : state.mode === 'active' ? '事件中' : '待機';
+      fill(redActive ? color(255, 90, 90) : textMuted);
+      const modeText = redActive ? '即將觸發' : state.mode === 'alert' ? '提醒中' : state.mode === 'active' ? '事件中' : '待機';
       textAlign(RIGHT, CENTER);
       text(modeText, width - 20, 35);
 
       // Current Event
       textSize(18);
-      fill(accent);
+      fill(redActive ? color(255, 90 + redPulse * 50, 90 + redPulse * 50) : accent);
       textAlign(LEFT, TOP);
       const title = state.currentEvent ? (state.currentEvent.content + ' @ ' + state.currentEvent.rawTime) : '無事件';
       text(title, 15, 75);
@@ -221,7 +276,11 @@ def time_reminder_component(events, trigger_ts=0):
       // Alert Bar
       if (state.mode !== 'idle') {{
         const barX = 15, barY = 110, barW = width - 30, barH = 24;
-        fill(red(accent), green(accent), blue(accent), 200);
+        if (redActive) {{
+          fill(255, 70, 70, 150 + redPulse * 90);
+        }} else {{
+          fill(red(accent), green(accent), blue(accent), 200);
+        }}
         rect(barX, barY, barW, barH, 6);
         
         fill(textPrimary);
@@ -240,6 +299,9 @@ def time_reminder_component(events, trigger_ts=0):
 
       // Timeline
       drawTimeline(state, accent);
+
+      // 奉茶 countdowns (left panel)
+      updateTeaCountdowns();
     }}
 
     function computeState(t) {{
@@ -281,22 +343,38 @@ def time_reminder_component(events, trigger_ts=0):
         if (ev.seconds < tMin || ev.seconds > tMax) continue;
         const x = map(ev.seconds, tMin, tMax, margin, width - margin);
         const isCurrent = state.currentEvent && state.currentEvent.seconds === ev.seconds;
+        const isRed = timer >= ev.seconds && timer - ev.seconds <= RED_WINDOW;
         noStroke();
-        fill(isCurrent ? red(accent) : 100, isCurrent ? green(accent) : 106, isCurrent ? blue(accent) : 124);
-        const r = isCurrent ? 8 : 5;
-        circle(x, y, r);
-        
+        if (isRed) {{
+          // Pulsing red halo + dot for the imminent event
+          fill(255, 70, 70, 60 + redPulse * 60);
+          circle(x, y, 16 + redPulse * 8);
+          fill(255, 70, 70);
+          circle(x, y, 9 + redPulse * 3);
+        }} else if (isCurrent) {{
+          fill(red(accent), green(accent), blue(accent));
+          circle(x, y, 8);
+        }} else {{
+          fill(100, 106, 124);
+          circle(x, y, 5);
+        }}
+
         // Label (Simplified for small canvas)
-        if (isCurrent) {{
-             fill(227, 230, 239); textSize(10); textAlign(CENTER, BOTTOM);
-             text(ev.rawTime, x, y - 8);
+        if (isCurrent || isRed) {{
+             fill(isRed ? color(255, 150, 150) : color(227, 230, 239)); textSize(10); textAlign(CENTER, BOTTOM);
+             text(ev.rawTime, x, y - 10);
         }}
       }}
 
       const xNow = map(timer, tMin, tMax, margin, width - margin);
-      stroke(206, 211, 223, 220);
-      strokeWeight(2);
-      line(xNow, y - 10, xNow, y + 10);
+      if (redActive) {{
+        stroke(255, 70, 70, 150 + redPulse * 105);
+        strokeWeight(3 + redPulse * 2);
+      }} else {{
+        stroke(206, 211, 223, 220);
+        strokeWeight(2);
+      }}
+      line(xNow, y - 12, xNow, y + 12);
     }}
 
     function renderEventsTable() {{
@@ -326,8 +404,65 @@ def time_reminder_component(events, trigger_ts=0):
             tag.className = 'tag tag-idle';
             tag.textContent = 'Idle';
           }}
+
+          // Flash the Time cell red for 5s starting at this event's time
+          const timeCell = tr.children[1];
+          if (timer >= ev.seconds && timer - ev.seconds <= RED_WINDOW) {{
+            timeCell.classList.add('flash-red');
+          }} else {{
+            timeCell.classList.remove('flash-red');
+          }}
         }});
-      }}, 500);
+      }}, 200);
+    }}
+
+    function renderTeaCountdowns() {{
+      const box = document.getElementById('teaCountdowns');
+      if (!box) return;
+      box.innerHTML = '';
+      for (const ev of teaEvents) {{
+        const m = (ev.content || '').match(/第.泡/);
+        const label = (m ? m[0] : '') + '奉茶';
+        const marks = (Array.isArray(ev.remindMins) && ev.remindMins.length)
+          ? ev.remindMins
+          : [TEA_DEFAULT_REMIND_MIN];
+        const row = document.createElement('div');
+        row.className = 'tea-row mono';
+        row.dataset.sec = ev.seconds;
+        row.dataset.marks = marks.join(',');   // 這一泡要提醒的分鐘點
+        row.innerHTML = '距離' + label + '還有 <span class="tea-remain">--:--</span>' +
+                        '<span class="tea-remind">請提醒製茶師時間!!</span>';
+        box.appendChild(row);
+      }}
+    }}
+
+    function updateTeaCountdowns() {{
+      const rows = document.querySelectorAll('#teaCountdowns .tea-row');
+      rows.forEach(row => {{
+        const sec = Number(row.dataset.sec);
+        const remain = sec - timer;
+        const span = row.querySelector('.tea-remain');
+        if (span) span.textContent = remain > 0 ? fmtMMSS(remain) : '--:--';
+
+        // 解析這一泡設定的提醒分鐘點（可多個，逗號分隔）
+        const marks = (row.dataset.marks || '')
+          .split(',')
+          .map(s => parseFloat(s))
+          .filter(n => !isNaN(n) && n > 0);
+
+        // 倒數進入任一分鐘點之後的 10 秒視窗 → 閃紅 + 文字提醒
+        let active = false;
+        for (const mMin of marks) {{
+          const mSec = mMin * 60;
+          if (remain <= mSec && remain > mSec - TEA_REMIND_DURATION) {{ active = true; break; }}
+        }}
+
+        if (active) {{
+          row.classList.add('tea-alert');
+        }} else {{
+          row.classList.remove('tea-alert');
+        }}
+      }});
     }}
 
     function updateStatusTag(s) {{

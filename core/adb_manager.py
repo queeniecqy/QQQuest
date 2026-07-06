@@ -30,6 +30,14 @@ OCULUS_SYSTEM_FOCUS_PACKAGES = (
     "com.oculus.panelapp",
     "com.oculus.vrguardianservice",
 )
+OCULUS_PANEL_OVERLAY_MARKERS = (
+    "com.oculus.panelapp.controlbar",
+    "com.oculus.panelapp.toasts",
+    "com.oculus.panelapp.bloom",
+    "controlbaractivity",
+    "toastsactivity",
+    "bloomactivity",
+)
 
 
 class ADBManager:
@@ -580,7 +588,76 @@ class ADBManager:
         if success:
             logger.info(f"已啟用 TCP/IP 模式: {device}")
         return success, output
-    
+
+    def reconnect_via_tcpip(
+        self,
+        ip: str,
+        port: int = ADB_DEFAULT_PORT,
+        prefer_serial: Optional[str] = None,
+        settle_seconds: float = 1.5
+    ) -> Tuple[bool, str]:
+        """
+        先把 USB 連線的設備切到 TCP/IP 模式，再用 WiFi 連接。
+
+        流程（等同手動操作）：
+            1. adb devices                  取得目前以 USB 連線的設備序號
+            2. adb -s <serial> tcpip <port> 把該設備切到 TCP/IP 模式
+            3. adb connect <ip>:<port>      再用 WiFi 連接
+
+        Args:
+            ip: 目標設備 IP
+            port: TCP/IP 端口（預設 5555）
+            prefer_serial: 偏好的 USB 序號（通常是 device.serial）；在 adb devices 中對得到就用它
+            settle_seconds: 下完 tcpip 後等待 adbd 重啟的秒數
+
+        Returns:
+            (success, output)；output 內含每一步的指令與結果，方便在 UI 顯示
+        """
+        import time
+
+        if not ip:
+            return False, "設備沒有 IP，無法以 TCP/IP 連接"
+
+        logs = []
+
+        # 1. adb devices（強制刷新，不用快取）
+        devices = self.get_devices(use_cache=False)
+        usb_devices = [
+            d for d in devices
+            if d.get('state') == 'device' and ':' not in str(d.get('serial', ''))
+        ]
+        listed = ', '.join(f"{d.get('serial')}({d.get('state')})" for d in devices) or '(無)'
+        logs.append(f"$ adb devices → {listed}")
+
+        # 2. 決定要對哪個 USB 序號下 tcpip
+        target_serial = None
+        if prefer_serial and any(d.get('serial') == prefer_serial for d in usb_devices):
+            target_serial = prefer_serial
+        elif len(usb_devices) == 1:
+            target_serial = usb_devices[0]['serial']
+
+        if target_serial:
+            ok_tcp, out_tcp = self.enable_tcpip(target_serial, port)
+            logs.append(f"$ adb -s {target_serial} tcpip {port} → {(out_tcp or '').strip() or ('OK' if ok_tcp else '失敗')}")
+            time.sleep(settle_seconds)   # tcpip 會重啟 adbd，稍等再連
+        elif not usb_devices:
+            logs.append("ℹ️ 沒有 USB 設備，純 WiFi 重連（略過 tcpip，直接 adb connect）")
+        else:
+            usb_list = ', '.join(d['serial'] for d in usb_devices)
+            logs.append(f"⚠️ 有多台 USB 設備且無法對應目標序號（prefer_serial={prefer_serial}），略過 tcpip：{usb_list}")
+
+        # 3. adb connect <ip>:<port>（剛重啟 adbd，失敗再等一下重試一次）
+        ok_conn, out_conn = self.connect(ip, port)
+        logs.append(f"$ adb connect {ip}:{port} → {(out_conn or '').strip()}")
+        success = ok_conn or 'already connected' in (out_conn or '').lower()
+        if not success and target_serial:
+            time.sleep(1.0)
+            ok_conn, out_conn = self.connect(ip, port)
+            logs.append(f"$ adb connect {ip}:{port} (retry) → {(out_conn or '').strip()}")
+            success = ok_conn or 'already connected' in (out_conn or '').lower()
+
+        return success, "\n".join(logs)
+
     def get_device_ip(self, device: str) -> Optional[str]:
         """取得設備 IP 地址"""
         # 嘗試取得 WiFi IP
@@ -1499,7 +1576,36 @@ class ADBManager:
         except Exception as e:
             logger.error(f"❌ 保持喚醒設置失敗: {device} - {e}")
             return False, f"保持喚醒設置失敗: {str(e)}"
-    
+
+    def _is_package_installed(self, device: str, package: str) -> bool:
+        """檢查 package 是否安裝在此設備。"""
+        ok, out = self.execute_shell_command(f"pm path {package}", device)
+        return ok and bool(out) and "package:" in out
+
+    def _resolve_launch_activity(self, device: str, package: str) -> Optional[str]:
+        """從 dumpsys 找出 package 處理 MAIN 的啟動 activity，回傳 'pkg/activity'；找不到/未安裝回 None。
+
+        activity 名稱會隨 Unity 版本/Player Settings 不同，直接讀 dumpsys 最可靠，
+        不必猜 LAUNCHER / VR 類別或固定的 Unity activity 名稱。
+        """
+        ok, out = self.execute_shell_command(f"dumpsys package {package}", device)
+        if not ok or not out or "Unable to find package" in out:
+            return None
+
+        import re
+        pattern = re.compile(rf"{re.escape(package)}/[A-Za-z0-9_.$]+")
+        lines = out.splitlines()
+        # 優先：android.intent.action.MAIN 區段下方第一個 pkg/activity（真正的啟動點）
+        for i, line in enumerate(lines):
+            if "android.intent.action.MAIN:" in line:
+                for nxt in lines[i + 1:i + 12]:
+                    m = pattern.search(nxt)
+                    if m:
+                        return m.group(0)
+        # 退而求其次：整段任何 pkg/activity 候選
+        m = pattern.search(out)
+        return m.group(0) if m else None
+
     def execute_launch_app(self, device: str, params: Dict[str, Any], room_info: Optional[Dict[str, Any]] = None) -> Tuple[bool, str]:
         """
         執行啟動應用動作
@@ -1530,35 +1636,59 @@ class ADBManager:
             if stop_existing:
                 self.execute_shell_command(f"am force-stop {package}", device)
                 logger.info(f"已關閉已運行的實例: {package}")
-            
-            # 構建啟動命令
+
+            # Socket Server 參數（給 am start 用）
+            socket_extras = ""
+            if room_info and room_info.get('socket_ip') and room_info.get('socket_port'):
+                socket_extras = (
+                    f" --es qqquest_server_ip \"{room_info['socket_ip']}\""
+                    f" --ei qqquest_server_port {room_info['socket_port']}"
+                )
+                logger.info(f"📡 添加 Socket Server 參數: {room_info['socket_ip']}:{room_info['socket_port']}")
+
+            wait_flag = " -W" if wait else ""
+
+            # 構建啟動命令（依序嘗試，第一個成功就停）
             if activity:
-                cmd = f"am start -n {package}/{activity}"
-                
-                # 如果提供了房間信息，添加 Socket Server 參數
-                if room_info and room_info.get('socket_ip') and room_info.get('socket_port'):
-                    socket_ip = room_info['socket_ip']
-                    socket_port = room_info['socket_port']
-                    cmd += f" --es qqquest_server_ip \"{socket_ip}\""
-                    cmd += f" --ei qqquest_server_port {socket_port}"
-                    logger.info(f"📡 添加 Socket Server 參數: {socket_ip}:{socket_port}")
+                launch_cmds = [f"am start -n {package}/{activity}{socket_extras}{wait_flag}"]
             else:
-                cmd = f"monkey -p {package} -c android.intent.category.LAUNCHER 1"
-            
-            if wait and activity:
-                cmd += " -W"
-            
-            success, output = self.execute_shell_command(cmd, device)
-            
-            if not success:
-                return False, f"啟動失敗: {output}"
-            
-            if "Error" in output or "error" in output.lower():
-                logger.error(f"❌ 啟動應用失敗: {package} - {output}")
-                return False, f"啟動失敗: {output}"
-            
-            logger.info(f"✅ 啟動應用成功: {package}")
-            return True, f"應用 {package} 已啟動"
+                # 沒指定 activity：一般 app 用 LAUNCHER；Quest/VR app 多半沒有 LAUNCHER，
+                # 再試常見的 Unity activity（名稱依 Unity 版本/Player Settings 而不同）與 VR 類別。
+                launch_cmds = [
+                    f"monkey -p {package} -c android.intent.category.LAUNCHER 1",
+                    f"am start -n {package}/com.unity3d.player.UnityPlayerActivity{socket_extras}{wait_flag}",
+                    f"am start -n {package}/com.unity3d.player.UnityPlayerGameActivity{socket_extras}{wait_flag}",
+                    f"monkey -p {package} -c com.oculus.intent.category.VR 1",
+                ]
+
+            last_output = ""
+            for cmd in launch_cmds:
+                success, output = self.execute_shell_command(cmd, device)
+                last_output = output
+                method = cmd.split()[0]  # monkey / am
+                if success and "Error" not in output and "error" not in output.lower():
+                    logger.info(f"✅ 啟動應用成功: {package}（{method}）")
+                    return True, f"應用 {package} 已啟動"
+                logger.warning(f"啟動嘗試失敗（{method}）: {package} - {output.strip()[:200]}")
+
+            # 以上都失敗且沒指定 activity → 動態解析（dumpsys）真正的啟動 activity 再試一次（最可靠）
+            if not activity:
+                resolved = self._resolve_launch_activity(device, package)
+                if resolved:
+                    cmd = f"am start -n {resolved}{socket_extras}{wait_flag}"
+                    success, output = self.execute_shell_command(cmd, device)
+                    last_output = output
+                    if success and "Error" not in output and "error" not in output.lower():
+                        logger.info(f"✅ 啟動應用成功: {package}（解析到 {resolved}）")
+                        return True, f"應用 {package} 已啟動"
+                    logger.warning(f"啟動嘗試失敗（解析 {resolved}）: {package} - {output.strip()[:200]}")
+                elif not self._is_package_installed(device, package):
+                    msg = f"應用未安裝於此設備：{package}"
+                    logger.error(f"❌ {msg}")
+                    return False, msg
+
+            logger.error(f"❌ 啟動應用失敗: {package} - {last_output}")
+            return False, f"啟動失敗: {last_output}"
         
         except Exception as e:
             logger.error(f"❌ 啟動應用失敗: {e}")
@@ -1592,6 +1722,38 @@ class ADBManager:
                     time.sleep(0.2)
                 send_back_events(back_events, delay=0.2)
 
+            def has_vrshell_panel_overlay(status: Dict[str, str]) -> bool:
+                summary = status.get('summary', '').lower()
+                return (
+                    "com.oculus.vrshell" in summary
+                    and any(marker in summary for marker in OCULUS_PANEL_OVERLAY_MARKERS)
+                )
+
+            def reset_vrshell_panel_overlay(label: str, status: Dict[str, str]) -> bool:
+                if not params.get('force_stop_vrshell_if_panel_overlay', False):
+                    return False
+
+                if not has_vrshell_panel_overlay(status):
+                    return False
+
+                logger.warning(
+                    f"⚠️ resume_app 偵測到 vrshell panel overlay，重置 Quest 系統覆蓋層 ({label}): "
+                    f"{status.get('summary', '')}"
+                )
+
+                if params.get('send_escape_before_vrshell_reset', True):
+                    send_overlay_clear_events(back_events=1, escape_events=1)
+
+                success, output = self.execute_shell_command("am force-stop com.oculus.vrshell", device)
+                logger.info(f"resume_app force-stop vrshell output ({device}): {output}")
+                time.sleep(float(params.get('vrshell_reset_wait_seconds', 1.0)))
+
+                if params.get('send_wakeup_after_vrshell_reset', True):
+                    self.execute_shell_command("input keyevent KEYCODE_WAKEUP", device)
+                    time.sleep(0.15)
+
+                return success
+
             back_count = int(params.get('back_count', 1 if params.get('send_back_first', False) else 0))
             send_back_events(back_count)
 
@@ -1605,6 +1767,7 @@ class ADBManager:
                     back_events=int(params.get('overlay_clear_back_count', 0)),
                     escape_events=int(params.get('overlay_clear_escape_count', 1))
                 )
+                reset_vrshell_panel_overlay("initial", focus_status)
 
             if (
                 params.get('clear_oculus_clearactivity', True)
@@ -1650,6 +1813,26 @@ class ADBManager:
                         am_cmd = f"am start -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -p {package}"
                     run_resume_command(f"{sequence_label} am start", am_cmd)
 
+            def verify_stable_focus(label: str, first_status: Dict[str, str]) -> Tuple[bool, Dict[str, str]]:
+                stable_checks = max(1, int(params.get('stable_focus_checks', 3)))
+                stable_interval = float(params.get('stable_focus_interval_seconds', 0.35))
+                current_status = first_status
+
+                for check_index in range(stable_checks):
+                    if check_index > 0:
+                        time.sleep(stable_interval)
+                        current_status = self._get_resume_focus_status(device, package)
+
+                    logger.info(
+                        f"resume_app stable focus {label} {check_index + 1}/{stable_checks} ({device}): "
+                        f"state={current_status['state']} {current_status['summary']}"
+                    )
+
+                    if current_status['state'] != 'app':
+                        return False, current_status
+
+                return True, current_status
+
             run_resume_sequence("primary")
 
             verify_focus = params.get('verify_focus', True)
@@ -1657,12 +1840,13 @@ class ADBManager:
                 time.sleep(float(params.get('focus_wait_seconds', 0.6)))
                 focus_status = self._get_resume_focus_status(device, package)
                 logger.info(f"resume_app focus after primary ({device}): {focus_status['summary']}")
+                focus_stable, focus_status = verify_stable_focus("primary", focus_status)
 
                 fallback_rounds = int(params.get('focus_fallback_rounds', 2))
                 fallback_back_count = int(params.get('focus_fallback_back_count', 1))
                 fallback_escape_count = int(params.get('focus_fallback_escape_count', 1))
                 for round_index in range(fallback_rounds):
-                    if focus_status['state'] == 'app':
+                    if focus_stable:
                         break
 
                     if focus_status['state'] in ('system_overlay', 'app_with_overlay'):
@@ -1677,10 +1861,12 @@ class ADBManager:
                             self.execute_shell_command("am force-stop com.oculus.os.clearactivity", device)
                             time.sleep(0.2)
 
-                        send_overlay_clear_events(
-                            back_events=fallback_back_count,
-                            escape_events=fallback_escape_count
-                        )
+                        panel_reset = reset_vrshell_panel_overlay(f"fallback {round_index + 1}", focus_status)
+                        if not panel_reset:
+                            send_overlay_clear_events(
+                                back_events=fallback_back_count,
+                                escape_events=fallback_escape_count
+                            )
                     else:
                         send_back_events(fallback_back_count)
 
@@ -1697,10 +1883,14 @@ class ADBManager:
                         f"resume_app focus after fallback {round_index + 1} ({device}): "
                         f"{focus_status['summary']}"
                     )
+                    focus_stable, focus_status = verify_stable_focus(f"fallback {round_index + 1}", focus_status)
 
-                if focus_status['state'] == 'app':
+                if focus_stable:
                     logger.info(f"✅ 已確認回到應用前景: {package}")
                     return True, f"已回到應用前景: {package}"
+
+                if focus_status['state'] == 'app':
+                    return False, f"遊戲焦點短暫回來，但沒有穩定停在前景: {focus_status['summary']}"
 
                 if focus_status['state'] == 'app_with_overlay':
                     return False, f"遊戲已恢復，但 Quest 系統面板仍覆蓋畫面: {focus_status['summary']}"
@@ -1750,47 +1940,58 @@ class ADBManager:
                 if any(keyword in stripped for keyword in focus_keywords):
                     focus_lines.append(stripped)
 
-        window_summary = " | ".join(focus_lines).lower()
-        should_read_activity = (
-            not focus_lines
-            or (
-                package.lower() not in window_summary
-                and not any(system_package in window_summary for system_package in OCULUS_SYSTEM_FOCUS_PACKAGES)
-            )
-        )
+        success, output = self.execute_shell_command("dumpsys activity activities", device, timeout=8)
+        if success:
+            for line in output.splitlines():
+                stripped = line.strip()
+                if any(keyword in stripped for keyword in focus_keywords):
+                    focus_lines.append(stripped)
+                elif any(keyword in stripped for keyword in resumed_keywords):
+                    resumed_lines.append(stripped)
 
-        if should_read_activity:
-            success, output = self.execute_shell_command("dumpsys activity activities", device, timeout=8)
-            if success:
-                for line in output.splitlines():
-                    stripped = line.strip()
-                    if any(keyword in stripped for keyword in focus_keywords):
-                        focus_lines.append(stripped)
-                    elif any(keyword in stripped for keyword in resumed_keywords):
-                        resumed_lines.append(stripped)
-
+        important_overlay_lines = [
+            line for line in resumed_lines
+            if "focusplaceholderactivity" in line.lower()
+            or any(system_package in line.lower() for system_package in OCULUS_SYSTEM_FOCUS_PACKAGES)
+        ]
         summary_lines = focus_lines[:6] + resumed_lines[:8]
-        summary = " | ".join(summary_lines[:8]).strip()
+        for line in important_overlay_lines:
+            if line not in summary_lines:
+                summary_lines.append(line)
+
+        summary = " | ".join(summary_lines[:10]).strip()
         if not summary:
             return {"state": "unknown", "summary": "無法讀取目前焦點"}
 
         focus_summary = " | ".join(focus_lines).lower()
-        lower_summary = " | ".join(summary_lines).lower()
+        lower_summary = " | ".join(focus_lines + resumed_lines).lower()
+        top_resumed_summary = " | ".join(
+            line for line in resumed_lines if "topresumedactivity" in line.lower()
+        ).lower()
         package_lower = package.lower()
 
         has_app_focus = package_lower in focus_summary
         has_oculus_focus = any(system_package in focus_summary for system_package in OCULUS_SYSTEM_FOCUS_PACKAGES)
         has_app = package_lower in lower_summary
-        has_oculus_overlay = any(system_package in lower_summary for system_package in OCULUS_SYSTEM_FOCUS_PACKAGES)
-
-        if has_app_focus:
-            return {"state": "app", "summary": summary}
-
-        if has_oculus_focus:
-            return {"state": "system_overlay", "summary": summary}
+        has_oculus_top_resumed = (
+            any(system_package in top_resumed_summary for system_package in OCULUS_SYSTEM_FOCUS_PACKAGES)
+            or "focusplaceholderactivity" in top_resumed_summary
+        )
+        has_focus_placeholder = "focusplaceholderactivity" in lower_summary
+        has_oculus_overlay = (
+            has_oculus_focus
+            or has_oculus_top_resumed
+            or has_focus_placeholder
+        )
 
         if has_app and has_oculus_overlay:
             return {"state": "app_with_overlay", "summary": summary}
+
+        if has_oculus_focus or has_oculus_top_resumed:
+            return {"state": "system_overlay", "summary": summary}
+
+        if has_app_focus:
+            return {"state": "app", "summary": summary}
 
         if has_app:
             return {"state": "app", "summary": summary}
@@ -2176,17 +2377,28 @@ class ADBManager:
                                 cmd += f" {flag} {param.name} {value}"
 
         else:
-            cmd = f"monkey -p {package} -c android.intent.category.LAUNCHER 1"
-        
-        if wait and activity: cmd += " -W"
-        
-        success, output = await self.execute_shell_command_async(cmd, device)
-        if not success: return False, f"啟動失敗: {output}"
-        
-        if "Error" in output or "error" in output.lower():
-            return False, f"啟動失敗: {output}"
-            
-        return True, f"應用 {package} 已啟動"
+            cmd = None  # 改用下方 launch_cmds 組裝
+
+        # 組裝要嘗試的啟動命令（依序嘗試，第一個成功就停）
+        if activity:
+            launch_cmds = [cmd + (" -W" if wait else "")]
+        else:
+            # 沒指定 activity：一般 app 用 LAUNCHER；Quest/VR app 多半沒有 LAUNCHER，
+            # 再試常見 Unity activity（名稱依 Unity 版本而不同）與 Oculus VR 類別。
+            launch_cmds = [
+                f"monkey -p {package} -c android.intent.category.LAUNCHER 1",
+                f"am start -n {package}/com.unity3d.player.UnityPlayerActivity" + (" -W" if wait else ""),
+                f"am start -n {package}/com.unity3d.player.UnityPlayerGameActivity" + (" -W" if wait else ""),
+                f"monkey -p {package} -c com.oculus.intent.category.VR 1",
+            ]
+
+        last_output = ""
+        for c in launch_cmds:
+            success, output = await self.execute_shell_command_async(c, device)
+            last_output = output
+            if success and "Error" not in output and "error" not in output.lower():
+                return True, f"應用 {package} 已啟動"
+        return False, f"啟動失敗: {last_output}"
 
     async def execute_resume_app_async(self, device: str, params: Dict[str, Any]) -> Tuple[bool, str]:
         """異步將背景中的應用帶回前景，不先關閉或重啟。"""

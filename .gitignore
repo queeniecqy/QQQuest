@@ -54,3 +54,10 @@ Thumbs.db
 .env.local
 
 
+
+# 設備資料備份/損毀檔（含設備 IP，不上傳）
+data/*.corrupt*
+data/*.bak-*
+data/devices.json.*
+# 背景音樂（版權/大檔，不上傳；bgm 資料夾由程式自動建立）
+bgm/*.mp3

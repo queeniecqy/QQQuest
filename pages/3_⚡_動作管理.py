@@ -5,6 +5,7 @@ import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 from typing import Optional, List, Tuple
 import time
+import pandas as pd
 from pathlib import Path
 from datetime import datetime
 from components.control_panel_cards import inject_control_panel_card_styles
@@ -52,8 +53,87 @@ def scan_apks_directory() -> List[Tuple[str, str, datetime]]:
     
     # 按創建時間排序（最新的在前）
     apk_files.sort(key=lambda x: x[2], reverse=True)
-    
+
     return apk_files
+
+
+# ===== 應用程式清單（應用名稱 ↔ package）：資料層在 core.app_list，給多頁共用 =====
+from core.app_list import load_app_list, save_app_list
+from utils.app_picker import app_override_dropdown, apply_package_override
+
+
+def render_app_list_manager():
+    """應用程式清單管理 UI：新增/編輯/匯入（應用名稱 ↔ package）。"""
+    with st.expander("📦 應用程式清單 (App List) — 設定可重啟的應用", expanded=False):
+        st.caption("維護「應用名稱 ↔ package」。重啟動作即可用『應用名稱』挑選要重啟的 app。"
+                   "可直接新增列，或從試算表複製貼上整批匯入。")
+        data = load_app_list()
+        df = pd.DataFrame(data)
+        if df.empty:
+            df = pd.DataFrame(columns=["name", "package"])
+        for col in ["name", "package"]:
+            if col not in df.columns:
+                df[col] = ""
+
+        edited_df = st.data_editor(
+            df[["name", "package"]],
+            column_config={
+                "name": st.column_config.TextColumn("應用名稱", help="顯示用名稱，例如：東方美人", required=True),
+                "package": st.column_config.TextColumn("Package 名稱", help="例如 com.Awespire.OrientalBeauty", required=True),
+            },
+            num_rows="dynamic",
+            use_container_width=True,
+            key="app_list_editor"
+        )
+
+        if st.button("💾 保存應用清單", key="save_app_list_btn"):
+            if save_app_list(edited_df):
+                st.success("✅ 應用清單已保存")
+                st.rerun()
+            else:
+                st.error("❌ 保存失敗")
+
+
+def render_package_picker(params: dict, key_prefix: str, current_package: str = "", verb: str = "重啟") -> str:
+    """共用的 package 選擇器：從『應用程式清單』挑，或手動輸入。設定並回傳 params['package']。
+
+    verb: 動作動詞（重啟／啟動／關閉／回前景），用於文案。
+    """
+    app_list = load_app_list()
+    MANUAL = "✏️ 手動輸入 package"
+    options = [f"{a['name']} — {a['package']}" for a in app_list] + [MANUAL]
+
+    # 預設選項：current_package 在清單中就選它，否則「手動輸入」
+    default_idx = len(options) - 1
+    if current_package:
+        for i, a in enumerate(app_list):
+            if a['package'] == current_package:
+                default_idx = i
+                break
+
+    sel = st.selectbox(
+        f"選擇要{verb}的應用",
+        options,
+        index=default_idx,
+        key=f"{key_prefix}_app_select",
+        help="從『應用程式清單』選擇應用（清單在動作管理頁上方『📦 應用程式清單』編輯／匯入）。"
+             "找不到就選『手動輸入』自行填 package。"
+    )
+
+    if sel == MANUAL:
+        params['package'] = st.text_input(
+            "Package 名稱 *",
+            value=current_package,
+            placeholder="com.example.app",
+            key=f"{key_prefix}_package_manual"
+        ).strip()
+    else:
+        chosen = app_list[options.index(sel)]
+        params['package'] = chosen['package']
+        st.caption(f"將{verb}：**{chosen['name']}**　`{chosen['package']}`")
+
+    return params['package']
+
 
 # 頁面配置
 st.set_page_config(
@@ -205,12 +285,7 @@ def add_action_dialog():
     
     elif selected_type == ActionType.LAUNCH_APP:
         st.info("🚀 執行程式")
-        params['package'] = st.text_input(
-            "Package 名稱 *",
-            placeholder="com.example.app",
-            help="應用程式的 package 名稱",
-            key="launch_package"
-        )
+        render_package_picker(params, "add_launch", verb="啟動")
         params['activity'] = st.text_input(
             "Activity 名稱（選填）",
             placeholder=".MainActivity",
@@ -223,12 +298,7 @@ def add_action_dialog():
     elif selected_type == ActionType.RESUME_APP:
         st.info("🎮 回到應用前景")
         st.caption("適合 Quest 誤觸穿透模式時，把仍在背景運行的遊戲帶回前景，不會先關閉或重啟。")
-        params['package'] = st.text_input(
-            "Package 名稱 *",
-            placeholder="com.Awespire.OrientalBeauty",
-            help="要帶回前景的應用程式 package 名稱",
-            key="resume_package"
-        )
+        render_package_picker(params, "add_resume", verb="回前景")
         params['send_back_first'] = st.checkbox(
             "先發送返回鍵",
             value=False,
@@ -238,12 +308,7 @@ def add_action_dialog():
     
     elif selected_type == ActionType.STOP_APP:
         st.info("🛑 關閉程式")
-        params['package'] = st.text_input(
-            "Package 名稱 *",
-            placeholder="com.example.app",
-            help="要關閉的應用程式 package 名稱",
-            key="stop_package"
-        )
+        render_package_picker(params, "add_stop", verb="關閉")
         params['method'] = st.selectbox(
             "關閉方式",
             options=["force-stop", "kill"],
@@ -255,12 +320,7 @@ def add_action_dialog():
     
     elif selected_type == ActionType.RESTART_APP:
         st.info("🔄 重啟應用")
-        params['package'] = st.text_input(
-            "Package 名稱 *",
-            placeholder="com.example.app",
-            help="要重啟的應用程式 package 名稱",
-            key="restart_package"
-        )
+        render_package_picker(params, "add_restart")
         params['activity'] = st.text_input(
             "Activity 名稱（選填）",
             placeholder=".MainActivity",
@@ -478,11 +538,7 @@ def edit_action_dialog(action: Action):
             st.markdown("- **模式 3**: AC 和 USB 充電時都保持喚醒，確保網路功能不被關閉（推薦）")
         
         elif action.action_type == ActionType.LAUNCH_APP:
-            params['package'] = st.text_input(
-                "Package 名稱 *",
-                value=params.get('package', ''),
-                placeholder="com.example.app"
-            )
+            render_package_picker(params, f"edit_launch_{action.action_id}", current_package=params.get('package', ''), verb="啟動")
             params['activity'] = st.text_input(
                 "Activity 名稱（選填）",
                 value=params.get('activity', ''),
@@ -492,11 +548,7 @@ def edit_action_dialog(action: Action):
             params['wait'] = st.checkbox("等待啟動完成", value=params.get('wait', True))
 
         elif action.action_type == ActionType.RESUME_APP:
-            params['package'] = st.text_input(
-                "Package 名稱 *",
-                value=params.get('package', ''),
-                placeholder="com.Awespire.OrientalBeauty"
-            )
+            render_package_picker(params, f"edit_resume_{action.action_id}", current_package=params.get('package', ''), verb="回前景")
             params['send_back_first'] = st.checkbox(
                 "先發送返回鍵",
                 value=params.get('send_back_first', False),
@@ -504,11 +556,7 @@ def edit_action_dialog(action: Action):
             )
         
         elif action.action_type == ActionType.STOP_APP:
-            params['package'] = st.text_input(
-                "Package 名稱 *",
-                value=params.get('package', ''),
-                placeholder="com.example.app"
-            )
+            render_package_picker(params, f"edit_stop_{action.action_id}", current_package=params.get('package', ''), verb="關閉")
             params['method'] = st.selectbox(
                 "關閉方式",
                 options=["force-stop", "kill"],
@@ -517,11 +565,7 @@ def edit_action_dialog(action: Action):
             params['verify'] = st.checkbox("驗證關閉成功", value=params.get('verify', True))
         
         elif action.action_type == ActionType.RESTART_APP:
-            params['package'] = st.text_input(
-                "Package 名稱 *",
-                value=params.get('package', ''),
-                placeholder="com.example.app"
-            )
+            render_package_picker(params, f"edit_restart_{action.action_id}", current_package=params.get('package', ''))
             params['activity'] = st.text_input(
                 "Activity 名稱（選填）",
                 value=params.get('activity', ''),
@@ -698,71 +742,82 @@ def execute_action_dialog(action: Action):
         st.info(action.description)
     
     st.markdown("---")
-    st.markdown("**選擇要執行的設備**")
-    
+
     # 獲取所有設備
     devices = st.session_state.device_registry.get_all_devices()
     online_devices = [d for d in devices if d.is_online]
-    
+
     if not online_devices:
         st.warning("⚠️ 沒有在線設備")
         if st.button("關閉"):
             st.session_state[f'execute_action_{action.action_id}'] = False
             st.rerun()
         return
-    
-    # 設備選擇
-    device_options = {d.device_id: d.display_name for d in online_devices}
-    selected_device_id = st.selectbox(
-        "設備",
-        options=list(device_options.keys()),
-        format_func=lambda did: device_options[did]
-    )
-    
-    selected_device = next(d for d in online_devices if d.device_id == selected_device_id)
-    
+
+    # 設備選擇（方框勾選，可多選；一次控制多台）
+    st.markdown("**選擇要執行的設備（可多選）**")
+    bcol1, bcol2, _ = st.columns([1, 1, 3])
+    with bcol1:
+        if st.button("✅ 全選", key=f"selall_{action.action_id}", use_container_width=True):
+            for d in online_devices:
+                st.session_state[f"execdev_{action.action_id}_{d.device_id}"] = True
+    with bcol2:
+        if st.button("⬜ 全不選", key=f"selnone_{action.action_id}", use_container_width=True):
+            for d in online_devices:
+                st.session_state[f"execdev_{action.action_id}_{d.device_id}"] = False
+
+    selected_devices = []
+    dev_cols = st.columns(2)
+    for i, d in enumerate(online_devices):
+        with dev_cols[i % 2]:
+            if st.checkbox(d.display_name, value=True, key=f"execdev_{action.action_id}_{d.device_id}"):
+                selected_devices.append(d)
+    st.caption(f"已選 {len(selected_devices)} / {len(online_devices)} 台")
+
+    # App 類動作：執行時可選擇要操作的應用（覆蓋動作預設 package，不改存檔）
+    exec_package_override = app_override_dropdown(action, key=f"exec_app_{action.action_id}")
+
     st.markdown("---")
-    
+
     col1, col2 = st.columns(2)
-    
+
     with col1:
         if st.button("▶️ 執行", type="primary", use_container_width=True):
-            with st.spinner("執行中..."):
-                # 自動查找設備所屬的房間並獲取 Socket Server 信息
-                room_info = None
-                if 'room_registry' in st.session_state:
-                    device_room = st.session_state.room_registry.get_device_room(selected_device.device_id)
-                    if device_room and device_room.socket_ip and device_room.socket_port:
-                        room_info = {
-                            'socket_ip': device_room.socket_ip,
-                            'socket_port': device_room.socket_port
-                        }
-                        logger.debug(f"📡 自動添加 Socket Server 參數: {selected_device.display_name} -> {device_room.name} ({device_room.socket_ip}:{device_room.socket_port})")
-                
-                # 執行動作
-                success, message = st.session_state.adb_manager.execute_action(
-                    selected_device.connection_string,
-                    action,
-                    room_info=room_info
-                )
-                
-                # 更新執行統計
-                action.increment_execution(success=success, status=message)
-                st.session_state.action_registry.update_action(action)
-                
-                if success:
-                    st.success(f"✅ {message}")
-                    logger.info(f"✅ 執行動作成功: {action.display_name} -> {selected_device.display_name}")
-                else:
-                    st.error(f"❌ {message}")
-                    logger.error(f"❌ 執行動作失敗: {action.display_name} -> {selected_device.display_name}")
-                
-                time.sleep(1.5)
-                st.session_state[f'execute_action_{action.action_id}'] = False
-                st.rerun()
-    
+            if not selected_devices:
+                st.warning("⚠️ 請至少勾選一台設備")
+            else:
+                exec_action = apply_package_override(action, exec_package_override)
+                results = []
+                success_count = 0
+                with st.spinner(f"在 {len(selected_devices)} 台設備上執行中..."):
+                    for dev in selected_devices:
+                        # 自動查找設備所屬房間的 Socket Server 信息
+                        room_info = None
+                        if 'room_registry' in st.session_state:
+                            device_room = st.session_state.room_registry.get_device_room(dev.device_id)
+                            if device_room and device_room.socket_ip and device_room.socket_port:
+                                room_info = {
+                                    'socket_ip': device_room.socket_ip,
+                                    'socket_port': device_room.socket_port
+                                }
+                        ok, msg = st.session_state.adb_manager.execute_action(
+                            dev.connection_string, exec_action, room_info=room_info
+                        )
+                        action.increment_execution(success=ok, status=msg)
+                        results.append((dev.display_name, ok, msg))
+                        if ok:
+                            success_count += 1
+                    st.session_state.action_registry.update_action(action)
+
+                fail_count = len(results) - success_count
+                st.success(f"✅ 成功 {success_count} 台" + (f"，❌ 失敗 {fail_count} 台" if fail_count else ""))
+                with st.expander("查看詳細結果", expanded=fail_count > 0):
+                    for name, ok, msg in results:
+                        st.write(f"{'✅' if ok else '❌'} {name}: {msg}")
+                logger.info(f"⚡ 批量執行動作: {action.display_name} (成功 {success_count}/{len(results)})")
+
     with col2:
-        if st.button("❌ 取消", use_container_width=True):
+        if st.button("❌ 關閉", use_container_width=True):
             st.session_state[f'execute_action_{action.action_id}'] = False
             st.rerun()
 
@@ -843,7 +898,10 @@ def main():
     """主函式"""
     st.title("⚡ 動作管理")
     st.caption("建立和管理可重複使用的設備動作")
-    
+
+    # 應用程式清單（重啟動作可從這裡挑要重啟的 app）
+    render_app_list_manager()
+
     # 頂部操作列
     col1, col2, col3 = st.columns([2, 1, 1])
     

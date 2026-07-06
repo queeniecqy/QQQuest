@@ -643,9 +643,14 @@ def render_device_card(device: Device):
                     if st.button(button_text, key=f"reconnect_{device.device_id}", use_container_width=True):
                         if device.ip:
                             logger.info(f"🔄 嘗試重新連線: {device.display_name} ({device.ip}:{device.port})")
-                            success, output = st.session_state.adb_manager.connect(device.ip, device.port)
+                            # 先 adb devices → adb -s <serial> tcpip 5555 → 再 adb connect
+                            success, output = st.session_state.adb_manager.reconnect_via_tcpip(
+                                device.ip, device.port, prefer_serial=device.serial
+                            )
                             logger.info(f"🔄 連線結果: success={success}, output={output}")
-                            
+                            with st.expander("🔍 查看 adb 步驟", expanded=not success):
+                                st.code(output)
+
                             if success or "already connected" in output.lower():
                                 st.success(f"✅ 已重新連線：{device.ip}:{device.port}")
                                 # 連接成功後，狀態會在下次掃描時自動更新為 ONLINE 或 OFFLINE

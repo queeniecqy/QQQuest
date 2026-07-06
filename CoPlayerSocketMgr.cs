@@ -21,6 +21,9 @@ namespace MultiPlayer
         [Tooltip("可选：连接成功后立即发送一条 hello/identify（仍然是 JSON+\\n）。若你的服务器不需要，可关掉。")]
         public bool sendIdentifyOnConnect = false;
 
+        [Tooltip("除錯用：把整包 JSON 夾進 heartbeat.message 一起送出（會讓每則心跳大小翻倍）。預設關閉以縮小封包。")]
+        public bool embedDebugJsonInMessage = false;
+
         private string deviceShortID = "";
 
         [Header("Connection Behavior")]
@@ -47,6 +50,10 @@ namespace MultiPlayer
 
         [Header("User Position Sync")]
         public Transform UserPositionTransform;
+
+        [Header("Sound Trigger")]
+        [Tooltip("收到後台 play_sound 指令時播放一次音效。需在 Inspector 指定場景中的 SoundTrigger。")]
+        public SoundTrigger soundTrigger;
 
         // TCP
         private TcpClient _client;
@@ -497,6 +504,12 @@ namespace MultiPlayer
                 return;
             }
 
+            if (string.Equals(msg_type, "play_sound", StringComparison.OrdinalIgnoreCase))
+            {
+                HandlePlaySound(msg);
+                return;
+            }
+
             SocketMsgType.FromServer fromServerType = SocketMsgType.GetFromServerMessageType(msg_type);
 
             switch (fromServerType)
@@ -538,6 +551,37 @@ namespace MultiPlayer
                 default:
                     Debug.Log($"<color=white>[TCP CoPlayer]</color> Type {msg_type} Not Yet Implement.");
                     break;
+            }
+        }
+
+        // 收到後台 play_sound 指令：觸發一次音效。
+        // sound_index 指定要播放清單裡的哪一個（發送提示1 = 0、發送提示2 = 1）；沒帶就預設 0。
+        // 在主執行緒 (DrainReceivedMessagesOnMainThread) 上呼叫，可安全播放音效。
+        private void HandlePlaySound(string msg)
+        {
+            // 診斷用：把收到的原始 JSON 印出來，確認 sound_index 有沒有送到。
+            Debug.Log($"<color=cyan>[TCP CoPlayer]</color> play_sound RAW: {msg}");
+
+            int soundIndex = 0;
+            try
+            {
+                PlaySoundEnvelope env = JsonUtility.FromJson<PlaySoundEnvelope>(msg);
+                if (env != null)
+                    soundIndex = env.sound_index;
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning($"<color=yellow>[TCP CoPlayer]</color> play_sound 解析失敗，改用索引 0：{e.Message}");
+            }
+
+            if (soundTrigger != null)
+            {
+                soundTrigger.PlayOnce(soundIndex);
+                Debug.Log($"<color=cyan>[TCP CoPlayer]</color> play_sound -> SoundTrigger.PlayOnce({soundIndex})");
+            }
+            else
+            {
+                Debug.LogWarning("<color=yellow>[TCP CoPlayer]</color> 收到 play_sound 但未指定 soundTrigger。");
             }
         }
 
@@ -595,17 +639,17 @@ namespace MultiPlayer
             if (realWorldPlayerLocateMgr != null)
             {
                 heartbeatPayload.heartbeat.SetChapter(realWorldPlayerLocateMgr.nowPreset);
-                // 原本的附加信息（下面会被 debug 文本覆盖；如果你想保留两者，请改成拼接）
+                // 附加信息（含後台要用的時間字串），保持精簡即可
                 heartbeatPayload.heartbeat.SetMessage(realWorldPlayerLocateMgr.AddtionalMsg);
             }
 
             MaybeSendUserPositionTransform(heartbeatPayload.heartbeat.chapter);
 
-            // ============================
-            // 方案 1：把你想看到的那串文字也传给 server
-            // 注意：这会把 heartbeat.message 覆盖成 debug 字符串
-            // ============================
-            heartbeatPayload.heartbeat.SetMessage("[TCP] Send HB: " + heartbeatPayload.ToJson());
+            // 除錯用：需要時才把整包 JSON 夾進 message（會讓封包翻倍）。預設關閉。
+            if (embedDebugJsonInMessage)
+            {
+                heartbeatPayload.heartbeat.SetMessage("[TCP] Send HB: " + heartbeatPayload.ToJson());
+            }
 
             // 发给 server
             SendData(heartbeatPayload.ToJson());
@@ -759,6 +803,14 @@ namespace MultiPlayer
                 .Replace("\r", "\\r");
         }
         #endregion
+    }
+
+    [Serializable]
+    public class PlaySoundEnvelope
+    {
+        public string message_type;
+        public string device_id;
+        public int sound_index;
     }
 
     [Serializable]

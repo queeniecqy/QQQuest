@@ -18,7 +18,9 @@ const socketIp = args[2] || '0.0.0.0';
 const socketPort = parseInt(args[3]) || 3000;
 
 const ADB_BIN = process.env.ADB || 'adb';
-const AUTO_RESUME_ENABLED = process.env.QQQUEST_AUTO_RESUME_ENABLED !== '0';
+const AUTO_RESUME_REQUESTED = process.env.QQQUEST_AUTO_RESUME_ENABLED === '1';
+// Manual-only mode: focus_state is logged, but ADB resume only runs from the UI button.
+const AUTO_RESUME_ENABLED = false;
 const AUTO_RESUME_PACKAGE = process.env.QQQUEST_AUTO_RESUME_PACKAGE || 'com.Awespire.OrientalBeauty';
 const AUTO_RESUME_ACTIVITY = process.env.QQQUEST_AUTO_RESUME_ACTIVITY || 'com.unity3d.player.UnityPlayerGameActivity';
 const AUTO_RESUME_ADB_PORT = process.env.QQQUEST_AUTO_RESUME_ADB_PORT || '5555';
@@ -916,6 +918,7 @@ server.listen(socketPort, socketIp, () => {
     log(`🚀 Socket Server 已啟動`);
     log(`📡 監聽地址: ${socketIp}:${socketPort}`);
     log(`🏠 房間: ${roomName} (ID: ${roomId})`);
+    log(`🎮 Resume mode: manual resume only${AUTO_RESUME_REQUESTED ? ' (QQQUEST_AUTO_RESUME_ENABLED ignored)' : ''}`);
     if (desiredUserPositionZ !== null) {
         log(`📐 Saved user position target: z=${desiredUserPositionZ.toFixed(3)}`);
     }

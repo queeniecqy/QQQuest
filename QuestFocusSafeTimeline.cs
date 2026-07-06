@@ -12,6 +12,7 @@ public class QuestFocusSafeTimeline : MonoBehaviour
     [Header("Disable only when input focus is lost")]
     [SerializeField] private Behaviour[] inputBehaviours;
     [SerializeField] private GameObject[] trackedVisuals;
+    [SerializeField] private bool disableTrackedVisualsOnInputFocusLost = false;
 
     [Header("Pause these only on real app pause")]
     [SerializeField] private AudioSource[] audioSources;
@@ -49,16 +50,29 @@ public class QuestFocusSafeTimeline : MonoBehaviour
     {
         NotifyServerFocusState("input_focus_lost", false, pausedByRealAppPause, "OVRManager.InputFocusLost");
         SetBehavioursEnabled(inputBehaviours, false);
-        SetGameObjectsActive(trackedVisuals, false);
+        if (disableTrackedVisualsOnInputFocusLost)
+        {
+            SetGameObjectsActive(trackedVisuals, false);
+        }
         EnsureMobileAudioOutput();
     }
 
     private void HandleInputFocusAcquired()
     {
-        SetBehavioursEnabled(inputBehaviours, true);
-        SetGameObjectsActive(trackedVisuals, true);
+        RestoreInputFocusObjects();
         EnsureMobileAudioOutput();
         NotifyServerFocusState("input_focus_acquired", true, pausedByRealAppPause, "OVRManager.InputFocusAcquired");
+    }
+
+    private void OnApplicationFocus(bool hasFocus)
+    {
+        if (!hasFocus)
+        {
+            return;
+        }
+
+        RestoreInputFocusObjects();
+        EnsureMobileAudioOutput();
     }
 
     private void OnApplicationPause(bool pauseStatus)
@@ -101,6 +115,7 @@ public class QuestFocusSafeTimeline : MonoBehaviour
         }
 
         pausedByRealAppPause = false;
+        RestoreInputFocusObjects();
         EnsureMobileAudioOutput();
         NotifyServerFocusState("application_resume", true, false, "OnApplicationPause(false)");
 
@@ -130,6 +145,12 @@ public class QuestFocusSafeTimeline : MonoBehaviour
         }
 
         SetAudioPaused(false);
+    }
+
+    private void RestoreInputFocusObjects()
+    {
+        SetBehavioursEnabled(inputBehaviours, true);
+        SetGameObjectsActive(trackedVisuals, true);
     }
 
     private void ApplyTimelineClock()

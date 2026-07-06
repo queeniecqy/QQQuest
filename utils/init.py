@@ -34,8 +34,8 @@ def ensure_initialization():
             st.error(f"⚠️ 系統初始化失敗: {e}")
             st.error("請檢查 ADB 是否正確安裝，或返回首頁重試")
             
-            if st.button("返回首頁"):
-                st.switch_page("app.py")
+            if st.button("返回首頁 / Return Home"):
+                st.rerun()
             
             st.stop()
             return False
@@ -142,4 +142,3 @@ def init_all():
     ensure_socket_server_manager()
     
     return True
-

@@ -1,10 +1,13 @@
 """
 設備註冊表 - 管理設備序號和歷史記錄
 """
+import json
+import threading
 import traceback
 from typing import Dict, List, Optional
 from datetime import datetime
 from tinydb import TinyDB, Query
+from tinydb.storages import JSONStorage
 from config.settings import DEVICE_REGISTRY_DB, DEVICES_DB
 from core.device import Device
 from utils.logger import get_logger
@@ -12,12 +15,46 @@ from utils.logger import get_logger
 logger = get_logger(__name__)
 
 
+class LockedJSONStorage(JSONStorage):
+    """TinyDB 儲存層：同一檔案共用鎖 + 損毀自動修復。
+
+    - UI 主執行緒與 ping 背景執行緒會同時讀寫同一個 JSON 檔；用 per-path 的鎖把
+      每次讀/寫序列化，避免寫入交錯造成 JSON 損毀（就是那個 'Extra data' 崩潰）。
+    - 讀到「尾端多出資料」型的損毀時，自動取合法 JSON 前綴修復並寫回，不讓整個 app 崩潰。
+    """
+    _locks: Dict[str, threading.RLock] = {}
+    _locks_guard = threading.Lock()
+
+    def __init__(self, path, *args, **kwargs):
+        super().__init__(path, *args, **kwargs)
+        with LockedJSONStorage._locks_guard:
+            # 同一檔案路徑共用同一把鎖（即使有多個 TinyDB 實例）
+            self._rw_lock = LockedJSONStorage._locks.setdefault(path, threading.RLock())
+
+    def read(self):
+        with self._rw_lock:
+            try:
+                return super().read()
+            except json.JSONDecodeError:
+                # 自我修復：讀合法 JSON 前綴、丟棄尾端多餘資料、寫回乾淨版本
+                self._handle.seek(0)
+                raw = self._handle.read()
+                obj, _ = json.JSONDecoder().raw_decode(raw)  # 若整段都壞會再拋錯
+                super().write(obj)
+                logger.warning(f"⚠️ 資料庫檔損毀，已自動修復並寫回: {self._handle.name}")
+                return obj
+
+    def write(self, data):
+        with self._rw_lock:
+            super().write(data)
+
+
 class DeviceRegistry:
     """設備註冊表類別"""
     
     def __init__(self):
-        self.registry_db = TinyDB(DEVICE_REGISTRY_DB)
-        self.devices_db = TinyDB(DEVICES_DB)
+        self.registry_db = TinyDB(DEVICE_REGISTRY_DB, storage=LockedJSONStorage)
+        self.devices_db = TinyDB(DEVICES_DB, storage=LockedJSONStorage)
         self.query = Query()
         logger.info("設備註冊表已初始化")
     
