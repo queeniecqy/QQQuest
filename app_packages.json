@@ -11,4 +11,13 @@
     "name": "三官出巡",
     "package": "com.AweSpire.ThreeTaoist"
   }
+  ,
+  {
+    "name": "Smile_CH",
+    "package": "com.imlab.Smile2_1_CH"
+  },
+  {
+    "name": "Smile_EN",
+    "package": "com.imlab.Smile2_1_EN"
+  }
 ]

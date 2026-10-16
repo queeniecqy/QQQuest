@@ -27,6 +27,139 @@ st.title("⚙️ 系統設定")
 st.markdown("---")
 
 
+def render_dhcp_tab():
+    """
+    固定 IP（DHCP 保留）：掃描區網，抓出每台 Quest 在這個 Wi-Fi 上實際使用的 MAC，
+    產生路由器要填的保留表。
+
+    重點：Android 14 預設每個 SSID 一組隨機 MAC，所以查硬體 MAC 是沒用的，
+    必須用實際在網路上通訊的這個 MAC。睡著的 Quest 整台會離開網路（ping 都不通），
+    所以結果採「累積」制，可分幾次趁不同機器醒著時掃。
+    """
+    from datetime import datetime
+    import pandas as pd
+    from tools.dhcp_reservations import (
+        local_subnet, ping_sweep, read_arp_table, load_known_devices,
+        load_state, save_state, write_csv, is_random_mac, adb_probe,
+        STATE_FILE, CSV_FILE, PROJECT_ROOT,
+    )
+
+    st.subheader("🔒 固定 IP（DHCP 保留）")
+    st.markdown(
+        "把每台 Quest 的 IP 在路由器上固定下來，IP 就不會再漂移，"
+        "adb 與自動重連才可靠。這裡掃出每台在**目前這個 Wi-Fi 上實際使用的 MAC**，"
+        "拿去路由器設定 DHCP 保留即可。"
+    )
+
+    c1, c2, c3 = st.columns([2, 1, 1])
+    with c1:
+        subnet = st.text_input("網段（前三段）", value=local_subnet() or "192.168.68",
+                               help="例如 192.168.68，會掃描 .1 ~ .254")
+    with c2:
+        use_adb = st.checkbox("用 adb 補機型", value=False,
+                              help="額外連上設備確認機型，較慢")
+    with c3:
+        st.write("")
+        scan = st.button("🔍 掃描網段", type="primary", use_container_width=True)
+
+    if scan:
+        if not subnet or len(subnet.split(".")) != 3:
+            st.error("網段格式不對，請填前三段，例如 192.168.68")
+        else:
+            with st.spinner(f"掃描 {subnet}.0/24 中（約 10-20 秒）…"):
+                ping_sweep(subnet)
+                arp = read_arp_table(subnet)
+                known = load_known_devices()
+                hits = {ip: mac for ip, mac in arp.items() if ip in known}
+
+                probes = {}
+                if use_adb and hits:
+                    from concurrent.futures import ThreadPoolExecutor
+                    with ThreadPoolExecutor(max_workers=8) as ex:
+                        probes = dict(zip(hits.keys(), ex.map(adb_probe, hits.keys())))
+
+                state = load_state()
+                now = datetime.now().strftime("%Y-%m-%d %H:%M")
+                for ip, mac in hits.items():
+                    entry = state.get(ip, {})
+                    entry.update({
+                        "ip": ip, "mac": mac,
+                        "alias": known.get(ip) or entry.get("alias", ""),
+                        "random_mac": is_random_mac(mac), "last_seen": now,
+                    })
+                    p = probes.get(ip) or {}
+                    if p.get("model"):
+                        entry["model"] = p["model"]
+                    state[ip] = entry
+                save_state(state)
+                write_csv(state)
+
+            if hits:
+                st.success(f"✅ 這次掃到 {len(hits)} 台（結果已累積，睡著的機器醒著時再掃一次即可補齊）")
+            else:
+                st.warning("這次沒掃到任何已登記的設備。Quest 睡著時整台會離開網路，"
+                           "請在設備醒著時（例如戴上頭盔）再掃一次。")
+
+    # ---- 目前累積結果 ----
+    state = load_state()
+    known = load_known_devices()
+
+    if not state:
+        st.info("目前還沒有任何結果。按上面的「🔍 掃描網段」開始，"
+                "建議趁大家戴著頭盔、設備都醒著時掃。")
+        return
+
+    rows = sorted(state.values(), key=lambda r: [int(x) for x in r["ip"].split(".")])
+    df = pd.DataFrame([{
+        "別名": r.get("alias") or "-",
+        "保留 IP": r["ip"],
+        "MAC": r["mac"],
+        "MAC 類型": "隨機" if r.get("random_mac") else "實體",
+        "機型": r.get("model", ""),
+        "最後偵測": r.get("last_seen", ""),
+    } for r in rows])
+
+    st.markdown(f"**已收集 {len(rows)} 台** — 把下面的 MAC ↔ IP 填進路由器的 DHCP 保留設定")
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+    d1, d2 = st.columns([1, 3])
+    with d1:
+        try:
+            st.download_button("⬇️ 下載 CSV", data=CSV_FILE.read_bytes(),
+                               file_name="dhcp_reservations.csv", mime="text/csv",
+                               use_container_width=True)
+        except Exception:
+            pass
+    with d2:
+        if st.button("🗑️ 清空累積結果", use_container_width=False):
+            try:
+                STATE_FILE.unlink()
+                st.success("已清空，可重新掃描")
+                st.rerun()
+            except Exception as e:
+                st.error(f"清空失敗: {e}")
+
+    # ---- 還沒收齊的 ----
+    missing = [(ip, a) for ip, a in known.items() if ip not in state]
+    same_net = [(ip, a) for ip, a in missing if subnet and ip.startswith(subnet + ".")]
+    other_net = [(ip, a) for ip, a in missing if not (subnet and ip.startswith(subnet + "."))]
+
+    if same_net:
+        st.warning(f"⏳ 還有 {len(same_net)} 台在本網段但沒回應（睡著或關機），醒著時再掃一次就會補進來：\n\n"
+                   + "、".join(f"{a or '-'} ({ip})" for ip, a in
+                               sorted(same_net, key=lambda x: [int(v) for v in x[0].split(".")])))
+    if other_net:
+        st.info(f"ℹ️ 另有 {len(other_net)} 筆登記在別的網段（掃不到，多半是舊記錄）：\n\n"
+                + "、".join(f"{a or '-'} ({ip})" for ip, a in sorted(other_net)))
+
+    if any(r.get("random_mac") for r in rows):
+        st.caption(
+            "💡 標示「隨機」的是 Android 14 的每網路隨機 MAC。同一個 Wi-Fi(SSID) 下它固定不變，"
+            "直接拿去設保留沒問題；但換 SSID、改密碼重連或「忘記此網路」後 MAC 會換一組，保留要重設。"
+            "想一勞永逸：在 Quest 該 Wi-Fi 的設定裡把隱私權改成「使用裝置 MAC」。"
+        )
+
+
 def main():
     """主函式"""
     
@@ -35,12 +168,15 @@ def main():
         st.session_state.user_config = get_user_config()
     
     # 創建標籤頁
-    tab1, tab2, tab3, tab4 = st.tabs(["📺 scrcpy 監看設定", "📸 截圖預覽設定", "🌐 網路監控設定", "💾 匯入/匯出"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "📺 scrcpy 監看設定", "📸 截圖預覽設定", "🌐 網路監控設定", "💾 匯入/匯出", "🔒 固定 IP (DHCP)"
+    ])
     
     # === scrcpy 監看設定 ===
     with tab1:
         st.header("📺 scrcpy 監看設定")
-        st.markdown("設定點擊「監看設備」時啟動 scrcpy 的參數")
+        st.markdown("設定點擊「監看設備」時啟動 scrcpy 的參數（單一設定來源，start_scrcpy 會直接讀這裡）")
+        st.caption("💡 預設已限流（位元率 2M / 寬 800 / 15fps / 唯讀）以降低頻寬；要更好畫質可自行調高。")
         st.markdown("---")
         
         scrcpy_config = st.session_state.user_config.get('scrcpy', SCRCPY_CONFIG.copy())
@@ -51,8 +187,8 @@ def main():
             st.subheader("🎬 視訊設定")
             
             # 位元率
-            bitrate_options = ["2M", "4M", "8M", "16M", "32M"]
-            current_bitrate = scrcpy_config.get('bitrate', '8M')
+            bitrate_options = ["1M", "2M", "4M", "8M", "16M", "32M"]
+            current_bitrate = scrcpy_config.get('bitrate', SCRCPY_CONFIG['bitrate'])
             if current_bitrate not in bitrate_options:
                 bitrate_options.append(current_bitrate)
                 bitrate_options.sort()
@@ -70,7 +206,7 @@ def main():
                 "最大畫面寬度（像素）",
                 min_value=480,
                 max_value=3840,
-                value=scrcpy_config.get('max_size', 512),
+                value=scrcpy_config.get('max_size', SCRCPY_CONFIG['max_size']),
                 step=128,
                 help="限制視訊寬度，0 表示無限制"
             )
@@ -80,7 +216,7 @@ def main():
                 "最大幀率（FPS）",
                 min_value=0,
                 max_value=120,
-                value=scrcpy_config.get('max_fps', 60),
+                value=scrcpy_config.get('max_fps', SCRCPY_CONFIG['max_fps']),
                 step=10,
                 help="限制幀率，0 表示無限制"
             )
@@ -174,6 +310,12 @@ def main():
         col1, col2, col3 = st.columns(3)
         
         with col1:
+            scrcpy_config['no_control'] = st.checkbox(
+                "唯讀監看（不控制設備）",
+                value=scrcpy_config.get('no_control', SCRCPY_CONFIG['no_control']),
+                help="--no-control：只看畫面、不接受滑鼠鍵盤操作。省一點頻寬也防誤觸。"
+                     "關閉才能使用『保持設備清醒 / 顯示觸控點 / 關閉設備螢幕』等需要控制權的選項。"
+            )
             scrcpy_config['stay_awake'] = st.checkbox(
                 "保持設備清醒",
                 value=scrcpy_config.get('stay_awake', True),
@@ -492,9 +634,13 @@ def main():
                 st.error("❌ 重置失敗！")
                 logger.error("重置設定失敗")
     
+    # === 固定 IP (DHCP 保留) ===
+    with tab5:
+        render_dhcp_tab()
+
     # === 儲存按鈕 ===
     st.markdown("---")
-    
+
     col1, col2, col3 = st.columns([2, 1, 1])
     
     with col2:

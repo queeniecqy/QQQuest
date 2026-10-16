@@ -306,6 +306,7 @@ function handleWho(socket, message, clientInfo) {
         playerList.push({
             device_id: deviceId,
             chapter: p.chapter,
+            language: (p.language === undefined ? -1 : p.language),
             sequence: p.sequence,
             message: p.message,
             timestamp: p.timestamp,
@@ -476,6 +477,12 @@ function handleAdminBroadcast(socket, message, clientInfo) {
     // Broadcast to ALL connected sockets
     broadcast(broadcastPayload);
 
+    // 記錄語言（讓後台面板顯示每台目前語言）
+    if (broadcastPayload.message_type === 'set_language') {
+        const gi = broadcastPayload.group_index === 1 ? 1 : 0;
+        players.forEach((p) => { p.language = gi; });
+    }
+
     sendJson(socket, {
         type: 'command_response',
         success: true,
@@ -515,6 +522,10 @@ function handleAdminUnicast(socket, message, clientInfo) {
     const targetPlayer = players.get(targetId);
     if (targetPlayer && targetPlayer.socket) {
         sendJson(targetPlayer.socket, unicastPayload);
+        // 記錄語言（讓後台面板顯示每台目前語言）
+        if (unicastPayload && unicastPayload.message_type === 'set_language') {
+            targetPlayer.language = unicastPayload.group_index === 1 ? 1 : 0;
+        }
         sendJson(socket, {
             type: 'command_response',
             success: true,
@@ -608,6 +619,9 @@ function createPlayer(deviceId, socket) {
         device_id: deviceId,
         sequence: sequenceCounter,
         chapter: -1,
+        // 新連上（含 restart 後重連）的設備，app 剛啟動會套用預設 group 0 → 中文。
+        // 所以預設 0；之後被 set_language 指令改成 1(英文)。restart→斷線刪除→重連建新 player→自動回 0(中文)。
+        language: 0,
         last_heartbeat_time: Date.now(),
         socket: socket,
         address: normalizeRemoteAddress(socket.remoteAddress),

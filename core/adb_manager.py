@@ -589,6 +589,198 @@ class ADBManager:
             logger.info(f"已啟用 TCP/IP 模式: {device}")
         return success, output
 
+    def prevent_sleep(self, device: str) -> Tuple[bool, str]:
+        """
+        讓 Quest 盡量不要進入休眠。
+
+        為什麼需要：Quest 一旦真正休眠，adbd 會整個停止（實測 5555 與無線偵錯 TLS 埠
+        雙雙 Connection refused），而 Quest 不支援 Wake-on-LAN——Android 平台沒有
+        WoWLAN API，連 ArborXR 的「睡眠時保持連線」也只支援 PICO 而非 Quest。
+        也就是說「睡著後遠端叫醒」做不到，唯一辦法是一開始就別讓它睡。
+
+        必須趁設備醒著（adb 可連）時套用。
+
+        限制（誠實說明）：
+        - stay_on_while_plugged_in 只在「插著電」時有效
+        - screen_off_timeout 只擋閒置計時器，擋不掉「摘下頭盔」觸發的睡眠
+        - prox_close 讓頭盔誤以為一直被戴著，是最有效的一項；但它是計時租約，
+          斷開 adb 連線後約 10 分鐘會自動恢復，需要定期重下
+
+        Returns:
+            (是否全部成功, 每個步驟的結果說明)
+        """
+        steps = [
+            ("input keyevent KEYCODE_WAKEUP", "喚醒螢幕"),
+            ("settings put global stay_on_while_plugged_in 7", "插電時不休眠"),
+            ("settings put system screen_off_timeout 2147483647", "螢幕不自動關閉"),
+            ("am broadcast -a com.oculus.vrpowermanager.prox_close", "關閉近接感應器"),
+        ]
+        logs, all_ok = [], True
+        for cmd, label in steps:
+            ok, out = self.execute_command(f"shell {cmd}", device, timeout=15)
+            out = (out or "").strip().replace("\n", " ")[:80]
+            if ok:
+                logs.append(f"✅ {label}")
+            else:
+                all_ok = False
+                logs.append(f"❌ {label}：{out or '失敗'}")
+        return all_ok, "；".join(logs)
+
+    WIRELESS_HELPER_PACKAGE = "tdg.oculuswirelessadb"
+
+    def install_wireless_helper(self, device: str, apk_path: str) -> Tuple[bool, str]:
+        """
+        安裝「無線 ADB helper」並授予 WRITE_SECURE_SETTINGS。
+
+        這個 App 的角色是保險：當某台重開機後 5555 與無線偵錯都關掉、adb 完全連不上時，
+        戴上頭盔開它一次就能把無線偵錯打開（那個「允許」確認框只能在頭盔裡按）。
+        平常的自動救援走的是 reconnect_via_mdns，用不到它。
+
+        Returns:
+            (是否就緒, 說明)
+        """
+        pkg = self.WIRELESS_HELPER_PACKAGE
+
+        ok, out = self.execute_command(f"shell pm list packages {pkg}", device, timeout=20)
+        already = pkg in (out or "")
+
+        if not already:
+            from pathlib import Path as _P
+            if not _P(apk_path).exists():
+                return False, f"找不到 APK：{apk_path}（先跑 python3 tools/setup_wireless_helper.py 下載）"
+            ok, out = self.execute_command(f"install -r {apk_path}", device, timeout=300)
+            if "Success" not in (out or ""):
+                return False, f"安裝失敗：{(out or '').strip()[:100]}"
+
+        self.execute_command(
+            f"shell pm grant {pkg} android.permission.WRITE_SECURE_SETTINGS",
+            device, timeout=20)
+        ok, out = self.execute_command(f"shell dumpsys package {pkg}", device, timeout=25)
+        granted = "WRITE_SECURE_SETTINGS: granted=true" in (out or "")
+        if not granted:
+            return False, "已安裝但授權失敗"
+        return True, ("已安裝並授權" if not already else "已裝過，授權正常")
+
+    def ensure_wireless_debugging(self, device: str) -> Tuple[bool, str]:
+        """
+        確保該設備的「無線偵錯」已啟用，作為重開機後的救援通道。
+
+        為什麼重要：Quest 重開機會清空 service.adb.tcp.port（5555 因此關閉）。若無線偵錯
+        是開的，adbd 會另外在隨機埠提供 TLS 連線並用 mDNS 廣播，我們就能從那裡連進去重下
+        tcpip 5555（見 reconnect_via_mdns）——不必接 USB，也不必戴頭盔開 App。
+        若無線偵錯是關的，重開機後就只能接線或戴頭盔。
+
+        重要條件（實測）：shell 雖持有 WRITE_SECURE_SETTINGS 寫得進去，但系統會檢查
+        「目前這個 Wi-Fi 網路（依 BSSID）是否已被信任」。沒被信任時，framework 會想在
+        頭盔裡跳出「允許在這個網路上使用無線偵錯？」的確認框，而頭盔螢幕沒亮時無法確認，
+        於是設定會在約 1 秒內被系統寫回 0。
+        因此「第一次」仍必須戴上頭盔確認一次（開 Oculus Wireless ADB 並按允許，
+        勾「一律允許」），之後同一個網路就能純用 adb 設定。
+
+        Returns:
+            (是否已啟用, 說明)
+        """
+        ok, out = self.execute_command("shell settings get global adb_wifi_enabled",
+                                       device, timeout=10)
+        current = (out or "").strip()
+        if current == "1":
+            return True, "無線偵錯已啟用"
+
+        ok, out = self.execute_command("shell settings put global adb_wifi_enabled 1",
+                                       device, timeout=10)
+        if not ok:
+            return False, f"啟用失敗：{(out or '').strip()[:100]}"
+
+        ok, out = self.execute_command("shell settings get global adb_wifi_enabled",
+                                       device, timeout=10)
+        if (out or "").strip() == "1":
+            return True, "已啟用無線偵錯（重開機後可自動救援）"
+        return False, ("設定被系統寫回 0：這個 Wi-Fi 網路尚未被該設備信任。"
+                       "請戴上頭盔（螢幕要亮）開一次 Oculus Wireless ADB 並按「允許」"
+                       "（勾「一律允許」），之後就能純用 adb 設定。")
+
+    def find_mdns_tls_port(self, ip: str) -> Optional[int]:
+        """
+        從 adb 的 mDNS 探索結果，找出該 IP 的「無線偵錯」TLS 埠。
+
+        背景：Quest 重開機後 `service.adb.tcp.port` 會被清空（非持久屬性），5555 因此關閉。
+        但若該機的無線偵錯（adb_wifi_enabled=1）仍啟用，adbd 會另外在一個「隨機埠」上
+        提供 TLS 連線並透過 mDNS 廣播。這個埠每次重開機都不一樣，所以只能動態查詢。
+
+        Returns:
+            埠號；找不到則 None
+        """
+        ok, output = self.execute_command("mdns services", timeout=10)
+        if not ok:
+            return None
+        # 格式：adb-XXXX-YYYY\t_adb-tls-connect._tcp\t192.168.68.90:36727
+        for line in output.splitlines():
+            if "_adb-tls-connect" not in line:
+                continue
+            m = re.search(rf"{re.escape(ip)}:(\d+)", line)
+            if m:
+                return int(m.group(1))
+        return None
+
+    def reconnect_via_mdns(
+        self,
+        ip: str,
+        port: int = ADB_DEFAULT_PORT,
+        settle_seconds: float = 2.5,
+    ) -> Tuple[bool, str]:
+        """
+        重開機後救援：不必接 USB、也不必戴頭盔開 App。
+
+        流程：mDNS 找出無線偵錯的 TLS 埠 → 連進去 → 下 tcpip 5555 → 再用 5555 連回來。
+
+        前提：該設備的無線偵錯必須是開啟的（adb_wifi_enabled=1）且本機金鑰已配對過。
+        實測若該機 adb_wifi_enabled=0，TLS 埠會 Connection refused，此時只能戴上頭盔
+        開一次 Oculus Wireless ADB（或手動開無線偵錯）。
+
+        Returns:
+            (是否成功, 過程說明)
+        """
+        import time
+
+        logs = []
+        tls_port = self.find_mdns_tls_port(ip)
+        if not tls_port:
+            return False, ("找不到無線偵錯廣播——該設備的無線偵錯可能沒開啟。"
+                           "需戴上頭盔開一次 Oculus Wireless ADB（或在開發者選項開啟無線偵錯）。")
+        logs.append(f"mDNS 找到無線偵錯埠：{ip}:{tls_port}")
+
+        tls_target = f"{ip}:{tls_port}"
+        ok, out = self.execute_command(f"connect {tls_target}", timeout=15)
+        out = (out or "").strip()
+        logs.append(f"$ adb connect {tls_target} → {out or ('OK' if ok else '失敗')}")
+        if "connected" not in out.lower():
+            if "refused" in out.lower():
+                return False, "\n".join(logs + [
+                    "TLS 埠拒絕連線：該設備的無線偵錯已關閉（mDNS 記錄是過期快取）。"
+                    "需戴上頭盔開一次 Oculus Wireless ADB。"])
+            return False, "\n".join(logs + ["無法連上無線偵錯埠"])
+
+        ok, out = self.enable_tcpip(tls_target, port)
+        logs.append(f"$ adb -s {tls_target} tcpip {port} → {(out or '').strip() or ('OK' if ok else '失敗')}")
+        time.sleep(settle_seconds)  # adbd 重啟需要一點時間
+
+        ok, out = self.connect(ip, port)
+        logs.append(f"$ adb connect {ip}:{port} → {(out or '').strip()}")
+        if not ok:
+            time.sleep(1.0)
+            ok, out = self.connect(ip, port)
+            logs.append(f"（重試）$ adb connect {ip}:{port} → {(out or '').strip()}")
+
+        # 以 adb devices 的實際狀態為準（adb connect 會樂觀回報成功）
+        target = f"{ip}:{port}"
+        live = {d.get('serial'): d.get('state')
+                for d in self.get_devices(use_cache=False)}
+        if live.get(target) == 'device':
+            logs.append(f"✅ {target} 已恢復（狀態 device）")
+            return True, "\n".join(logs)
+        logs.append(f"❌ {target} 狀態為 {live.get(target) or '不存在'}")
+        return False, "\n".join(logs)
+
     def reconnect_via_tcpip(
         self,
         ip: str,
@@ -1130,13 +1322,10 @@ class ADBManager:
             if not self.check_scrcpy_available():
                 return False, "scrcpy 未安裝，請先安裝 scrcpy"
             
-            # 載入系統設定
-            from config.settings import get_user_config
+            # 載入系統設定（單一設定來源：SCRCPY_CONFIG 當預設底、使用者設定覆蓋、傳入 options 最優先）
+            from config.settings import get_user_config, SCRCPY_CONFIG
             user_config = get_user_config()
-            scrcpy_config = user_config.get('scrcpy', {})
-            
-            # 合併選項（傳入的 options 優先）
-            final_options = scrcpy_config.copy()
+            final_options = {**SCRCPY_CONFIG, **user_config.get('scrcpy', {})}
             if options:
                 final_options.update(options)
             
@@ -1156,50 +1345,58 @@ class ADBManager:
             if final_crop:
                 cmd.extend(['--crop', final_crop])
             
-            # 位元率
-            if final_options.get('bitrate'):
-                cmd.extend(['-b', str(final_options['bitrate'])])
-            
+            # === 頻寬限流：預設值全部來自 SCRCPY_CONFIG（唯一來源），使用者可在系統設定頁調整 ===
+            # 位元率：scrcpy 3.x 用 --video-bit-rate
+            bitrate = final_options.get('bitrate') or SCRCPY_CONFIG['bitrate']
+            cmd.extend(['--video-bit-rate', str(bitrate)])
+
             # 最大畫面寬度
-            if final_options.get('max_size'):
-                cmd.extend(['-m', str(final_options['max_size'])])
-            
+            max_size = final_options.get('max_size', SCRCPY_CONFIG['max_size'])
+            if max_size:
+                cmd.extend(['-m', str(max_size)])
+
             # 最大幀率
-            if final_options.get('max_fps') and final_options['max_fps'] > 0:
-                cmd.extend(['--max-fps', str(final_options['max_fps'])])
-            
+            max_fps = final_options.get('max_fps', SCRCPY_CONFIG['max_fps'])
+            if max_fps and int(max_fps) > 0:
+                cmd.extend(['--max-fps', str(max_fps)])
+
+            # 唯讀監看（--no-control）：省一點頻寬也防誤觸。可在系統設定頁把 no_control 關掉以取得控制權
+            control_enabled = not final_options.get('no_control', SCRCPY_CONFIG['no_control'])
+            if not control_enabled:
+                cmd.append('--no-control')
+
             # 視窗大小
             if final_options.get('window_width'):
                 cmd.extend(['--window-width', str(final_options['window_width'])])
             if final_options.get('window_height'):
                 cmd.extend(['--window-height', str(final_options['window_height'])])
-            
+
             # 視窗位置
             if final_options.get('window_x') is not None:
                 cmd.extend(['--window-x', str(final_options['window_x'])])
             if final_options.get('window_y') is not None:
                 cmd.extend(['--window-y', str(final_options['window_y'])])
-            
+
             # 渲染驅動
             if final_options.get('render_driver'):
                 cmd.extend(['--render-driver', final_options['render_driver']])
-            
-            # 布林選項
-            if final_options.get('stay_awake', True):
+
+            # 布林選項（以下需要 control 模式；--no-control 時自動略過，避免 scrcpy 報錯而啟動失敗）
+            if control_enabled and final_options.get('stay_awake', True):
                 cmd.append('--stay-awake')
-            
-            if final_options.get('show_touches', False):
+
+            if control_enabled and final_options.get('show_touches', False):
                 cmd.append('--show-touches')
-            
+
             if final_options.get('fullscreen', False):
                 cmd.append('--fullscreen')
-            
+
             if final_options.get('always_on_top', False):
                 cmd.append('--always-on-top')
-            
-            if final_options.get('turn_screen_off', False):
+
+            if control_enabled and final_options.get('turn_screen_off', False):
                 cmd.append('--turn-screen-off')
-            
+
             # 音訊設定 - 預設禁用以避免關閉 Quest 的聲音
             if not final_options.get('enable_audio', False):
                 cmd.append('--no-audio')
@@ -1236,7 +1433,102 @@ class ADBManager:
             # crop=QUEST_SINGLE_EYE_CROP,  # 暫時關閉單眼裁切，用於測試黑屏是否與 crop 有關
             auto_arrange=auto_arrange
         )
-    
+
+    def ffmpeg_available(self) -> bool:
+        """Mac 端有沒有 ffmpeg（裝置端縮圖法要用它抽幀）。結果快取。"""
+        if getattr(self, '_ffmpeg_ok', None) is None:
+            import shutil
+            self._ffmpeg_ok = shutil.which('ffmpeg') is not None
+        return self._ffmpeg_ok
+
+    def capture_screenshot(self, device: str, max_width: int = 320, quality: int = 50,
+                           method: str = "ondevice") -> Optional[bytes]:
+        """抓一張縮圖（給畫面牆用），回傳 JPEG bytes；失敗回 None。
+
+        method:
+          'ondevice'  裝置端用 screenrecord 縮放 → ffmpeg 抽 1 幀 → JPEG。
+                      小又快（Quest 實測 ~1.2s / ~20KB），需要 Mac 有 ffmpeg。
+                      （這是 minicap 的替代：minicap 在 Android 12+/SDK34 已無法運作。）
+          'screencap' adb screencap 全解析度 PNG → Mac 端縮放。相容任何裝置，但很重
+                      （Quest 是雙眼 framebuffer，一張 ~10MB、透過 WiFi 要十幾秒）。
+        """
+        if method in ("ondevice", "minicap", "screenrecord"):
+            data = self._capture_ondevice(device, max_width, quality)
+            if data is not None:
+                return data
+            # ondevice 失敗就回 None（不自動退回很重的 screencap，避免拖垮）
+            return None
+        return self._capture_screencap(device, max_width, quality)
+
+    def _capture_ondevice(self, device: str, max_width: int, quality: int) -> Optional[bytes]:
+        """裝置端 screenrecord 縮放 → ffmpeg 抽 1 幀 → JPEG。需 ffmpeg。失敗回 None。"""
+        if not self.ffmpeg_available():
+            return None
+
+        w = max(2, int(max_width) - (int(max_width) % 2))
+        h = int(round(w * 9 / 16))
+        h -= h % 2
+        # UI quality(20~90, 高=好) 映射到 ffmpeg -q:v(2~31, 低=好)
+        qv = max(2, min(31, int(round(2 + (90 - int(quality)) / 70 * 29))))
+
+        p1 = None
+        try:
+            # 裝置端就把畫面縮到 w×h 再編 h264（傳出來只有幾十 KB），exec-out 為 binary-safe
+            p1 = subprocess.Popen(
+                ['adb', '-s', device, 'exec-out', 'screenrecord',
+                 '--output-format=h264', '--size', f'{w}x{h}',
+                 '--bit-rate', '1000000', '--time-limit', '1', '-'],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+            )
+            ff = subprocess.run(
+                ['ffmpeg', '-hide_banner', '-loglevel', 'error', '-f', 'h264',
+                 '-i', 'pipe:0', '-frames:v', '1', '-q:v', str(qv), '-f', 'mjpeg', 'pipe:1'],
+                stdin=p1.stdout, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=20
+            )
+            try:
+                p1.stdout.close()
+            except Exception:
+                pass
+            p1.wait(timeout=5)
+
+            data = ff.stdout
+            if data and data[:3] == b'\xff\xd8\xff':
+                return data
+            return None
+        except Exception as e:
+            logger.debug(f"裝置端擷取失敗 {device}: {e}")
+            return None
+        finally:
+            if p1 is not None and p1.poll() is None:
+                try:
+                    p1.kill()
+                except Exception:
+                    pass
+
+    def _capture_screencap(self, device: str, max_width: int, quality: int) -> Optional[bytes]:
+        """adb screencap 全解析度 PNG → Mac 端縮放成 JPEG。相容但重（Quest ~10MB/張）。"""
+        try:
+            # -p 輸出 PNG；exec-out 為 binary-safe。Quest framebuffer 很大，timeout 放寬到 25s。
+            result = subprocess.run(
+                ['adb', '-s', device, 'exec-out', 'screencap', '-p'],
+                capture_output=True, timeout=25
+            )
+            if result.returncode != 0 or not result.stdout:
+                return None
+
+            from PIL import Image
+            import io
+            img = Image.open(io.BytesIO(result.stdout))
+            w, h = img.size
+            if w > max_width:
+                img = img.resize((max_width, max(1, int(h * max_width / w))))
+            buf = io.BytesIO()
+            img.convert('RGB').save(buf, format='JPEG', quality=int(quality))
+            return buf.getvalue()
+        except Exception as e:
+            logger.debug(f"screencap 擷取失敗 {device}: {e}")
+            return None
+
     def start_app(self, device: str, package: str, activity: str) -> Tuple[bool, str]:
         """啟動應用程式"""
         return self.execute_shell_command(

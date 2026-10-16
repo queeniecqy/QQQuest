@@ -2023,11 +2023,19 @@ def render_realtime_status_content(room: Room, events, editable: bool = True, ed
                         if resolved_alias:
                             current_alias = resolved_alias
 
+                        lang_val = p.get('language', -1)
+                        try:
+                            lang_val = int(lang_val)
+                        except (TypeError, ValueError):
+                            lang_val = -1
+                        lang_display = "🀄 中文" if lang_val == 0 else "🔤 英文" if lang_val == 1 else "—"
+
                         status_data.append({
                             "device_id": p_id,
                             "registry_device_id": device_obj.device_id if device_obj else "",
                             "alias": current_alias,
                             "chapter": chapter if chapter != -1 else 0,
+                            "language": lang_display,
                             "current_time": current_time_str,
                             "user_position_z": user_position_z,
                             "adb_target": adb_target
@@ -2093,10 +2101,11 @@ def render_realtime_status_content(room: Room, events, editable: bool = True, ed
                                 "device_id": st.column_config.TextColumn("設備 ID", help="設備唯一標識符", disabled=True),
                                 "alias": st.column_config.TextColumn("備註名稱 (可編輯)", help="點擊編輯設備備註"),
                                 "chapter": st.column_config.NumberColumn("當前章節", format="%d", disabled=True),
+                                "language": st.column_config.TextColumn("語言", help="目前設定的語言（由語言切換指令記錄；0=中文、1=英文）", disabled=True),
                                 "current_time": st.column_config.TextColumn("當前時間", help="從心跳訊息解析的時間", disabled=True),
                                 "user_position_z": st.column_config.NumberColumn("使用者位置", format="%.3f", help="章節 5 時由 Client 回傳的 z 座標", disabled=True),
                             },
-                            "column_order": ["device_id", "alias", "chapter", "current_time", "user_position_z"],
+                            "column_order": ["device_id", "alias", "chapter", "language", "current_time", "user_position_z"],
                             "width": "stretch",
                             "row_height": STATUS_TABLE_ROW_HEIGHT,
                             "hide_index": True,
@@ -2334,51 +2343,78 @@ def send_play_sound_command(room: Room, target_device_ids, sound_index: int):
     return ok_count, fails
 
 
-@st.fragment(run_every="1s")
+def send_language_command(room: Room, group_index: int, target_device_ids=None):
+    """發送 set_language（0=中文 / 1=英文）。
+
+    target_device_ids=None → admin_broadcast 給全部；否則 admin_unicast 給指定設備。
+    回傳 (成功數, 失敗訊息list)；廣播成功回 (1, [])。
+    """
+    from core.socket_client import SocketClient
+    gi = 1 if int(group_index) == 1 else 0
+    fails = []
+    try:
+        with SocketClient(room.socket_ip, room.socket_port) as client:
+            if target_device_ids is None:
+                # 全體廣播
+                ok, resp = client.send_command(
+                    "admin_broadcast",
+                    {"message_type": "set_language", "group_index": gi}
+                )
+                if ok:
+                    return 1, []
+                return 0, [f"廣播失敗: {resp.get('message', '未知錯誤')}"]
+
+            # 指定設備 unicast
+            ok_count = 0
+            for dev_id in target_device_ids:
+                payload = {
+                    "target_device_id": dev_id,
+                    "data": {"message_type": "set_language", "group_index": gi},
+                }
+                ok, resp = client.send_command("admin_unicast", payload)
+                if ok and resp.get("success"):
+                    ok_count += 1
+                else:
+                    fails.append(f"{get_sound_device_display(dev_id)}: {resp.get('message', '未知錯誤')}")
+            return ok_count, fails
+    except Exception as e:
+        return 0, [f"連接失敗: {e}"]
+
+
 def render_sound_trigger_buttons(room: Room, sound_device_ids):
-    """兩顆提示按鈕：按下其中一顆後，在冷卻時間內把『另一顆』鎖住，避免誤觸。
-    用 run_every 局部刷新，冷卻結束會自動解鎖（不需手動互動）。"""
+    """兩顆提示按鈕：發送提示1 / 提示2 給已勾選的設備。
+
+    避免誤觸：用時間護欄——冷卻時間內再按會被擋下並提示（不用 run_every 局部刷新，
+    避免在 dialog 內因 fragment 自刷造成 widget key 重複的崩潰）。
+    """
     import time
 
     busy_key = f"sound_busy_until_{room.room_id}"
-    active_key = f"sound_active_idx_{room.room_id}"
     cooldown = float(st.session_state.get(f"sound_cooldown_{room.room_id}", 3.0))
-
-    now = time.time()
-    busy_until = float(st.session_state.get(busy_key, 0.0))
-    active_idx = int(st.session_state.get(active_key, -1))
-    busy = now < busy_until
-    remain = max(0.0, busy_until - now)
-
-    # 從 checkbox 的 session_state 取目前勾選的設備（fragment 自刷時也能拿到最新勾選）
     selected = [d for d in sound_device_ids if st.session_state.get(f"sound_cb_{room.room_id}_{d}")]
 
     def fire(idx, label):
         if not selected:
             st.toast("⚠️ 請至少勾選一台設備", icon="⚠️")
             return
-        # 先鎖定，再送指令；之後局部 rerun 立即把另一顆變灰
-        st.session_state[busy_key] = time.time() + cooldown
-        st.session_state[active_key] = idx
+        now = time.time()
+        busy_until = float(st.session_state.get(busy_key, 0.0))
+        if now < busy_until:
+            st.toast(f"⏳ 冷卻中，請等 {busy_until - now:.0f}s（避免誤觸）", icon="⏳")
+            return
+        st.session_state[busy_key] = now + cooldown
         ok_count, fails = send_play_sound_command(room, selected, idx)
         if ok_count > 0:
             st.toast(f"✅ 已發送{label}（{ok_count} 台）")
         if fails:
             st.toast("❌ 部分失敗：" + "；".join(fails), icon="⚠️")
-        st.rerun(scope="fragment")
 
     col1, col2 = st.columns(2)
     with col1:
-        lock0 = busy and active_idx != 0
-        label0 = f"🔒 提示1（{remain:.0f}s）" if lock0 else "🔊 發送提示1"
-        if st.button(label0, type="primary", width="stretch", disabled=lock0,
-                     key=f"btn_send_sound1_{room.room_id}"):
+        if st.button("🔊 發送提示1", type="primary", width="stretch", key=f"btn_send_sound1_{room.room_id}"):
             fire(0, "提示1")
     with col2:
-        lock1 = busy and active_idx != 1
-        label1 = f"🔒 提示2（{remain:.0f}s）" if lock1 else "🔊 發送提示2"
-        if st.button(label1, type="primary", width="stretch", disabled=lock1,
-                     key=f"btn_send_sound2_{room.room_id}"):
+        if st.button("🔊 發送提示2", type="primary", width="stretch", key=f"btn_send_sound2_{room.room_id}"):
             fire(1, "提示2")
 
 
@@ -2864,52 +2900,19 @@ def room_view_dialog(room: Room):
                 st.rerun()
         col = st.columns(2)
         with col[0]:
-            if st.button("📺 CCTV 監控牆 (所有設備)", key=f"cctv_{room.room_id}", use_container_width=True, type="primary"):
-                monitor_devices = [device for device in room_devices if device.is_online]
+            # 取代原本 CCTV 牆 → 在「新分頁」開啟畫面牆（不離開房間管理頁）。
+            # 用 target="_blank" 的連結；相對路徑 "screenwall" 對應 app.py 設的 url_path。
+            st.markdown(
+                '<a href="screenwall" target="_blank" '
+                'style="display:block;box-sizing:border-box;width:100%;text-align:center;'
+                'padding:0.45rem 1rem;background:#ff4b4b;color:#fff;border-radius:0.5rem;'
+                'text-decoration:none;font-weight:600;line-height:1.6;">'
+                '🖥️ 開啟畫面牆 (新分頁)</a>',
+                unsafe_allow_html=True,
+            )
 
-                if not room_devices:
-                    st.warning("⚠️ 此房間內沒有設備")
-                elif not monitor_devices:
-                    st.warning("⚠️ 此房間內沒有在線設備可供監看")
-                else:
-                    import time
-
-                    device_count = len(monitor_devices)
-                    st.toast(f"將依序開啟 {device_count} 台設備的單眼監看視窗...", icon="📺")
-
-                    progress_text = st.empty()
-                    progress_bar = st.progress(0)
-                    success_count = 0
-                    failure_count = 0
-                    st.session_state.adb_manager.reset_scrcpy_window_layout()
-
-                    for index, device in enumerate(monitor_devices, start=1):
-                        progress_text.text(f"正在開啟 {index}/{device_count}: {device.display_name}")
-                        success, message = start_room_device_monitor(
-                            device,
-                            room,
-                            layout_slot=index - 1,
-                            layout_total=device_count
-                        )
-                        if success:
-                            success_count += 1
-                        else:
-                            failure_count += 1
-                            st.warning(f"⚠️ {device.display_name}: {message}")
-
-                        progress_bar.progress(index / device_count)
-                        time.sleep(1.2)
-
-                    progress_text.empty()
-                    progress_bar.empty()
-
-                    if failure_count == 0:
-                        st.success(f"✅ 已依序開啟 {success_count} 台設備監看視窗")
-                    else:
-                        st.warning(f"⚠️ 監看視窗已開啟 {success_count} 台，失敗 {failure_count} 台")
-        
         with col[1]:
-            if st.button("🛑 關閉所有監控 (Stop All)", key=f"stop_cctv_{room.room_id}", use_container_width=True):
+            if st.button("🛑 關閉所有 scrcpy 視窗 (Stop All)", key=f"stop_cctv_{room.room_id}", use_container_width=True):
                  try:
                      import subprocess
                      if subprocess.run(["pkill", "scrcpy"]).returncode == 0:
@@ -3381,6 +3384,77 @@ def room_view_dialog(room: Room):
                         st.info(f"📂 bgm 資料夾目前沒有 mp3，請把音樂放到：`{bgm_dir}`")
                     else:
                         bgm_player_component(bgm_tracks, height=300)
+
+            # --- 語言切換 (Language) ---
+            st.divider()
+            st.markdown("#### 🌐 語言切換 (Language)")
+            st.caption("切換 Quest 上 LanguageSwitch 的語言（0 = 中文 / 1 = 英文）。可全體一鍵切換，或指定設備切換。")
+
+            if not socket_running:
+                st.error("❌ Socket Server 未運行")
+            else:
+                # 全體一鍵切換（broadcast）
+                st.markdown("**全體一鍵切換**")
+                lang_all_zh, lang_all_en = st.columns(2)
+                with lang_all_zh:
+                    if st.button("🀄 全部 → 中文", key=f"lang_all_zh_{room.room_id}", use_container_width=True, type="primary"):
+                        n, fails = send_language_command(room, 0, target_device_ids=None)
+                        if n:
+                            st.toast("✅ 已廣播：全部切換為中文")
+                        if fails:
+                            st.toast("❌ " + "；".join(fails), icon="⚠️")
+                with lang_all_en:
+                    if st.button("🔤 全部 → 英文", key=f"lang_all_en_{room.room_id}", use_container_width=True, type="primary"):
+                        n, fails = send_language_command(room, 1, target_device_ids=None)
+                        if n:
+                            st.toast("✅ 已廣播：全部切換為英文")
+                        if fails:
+                            st.toast("❌ " + "；".join(fails), icon="⚠️")
+
+                # 指定設備切換（unicast）
+                st.markdown("**指定設備切換**")
+                lang_online_players = []
+                from core.socket_client import SocketClient
+                try:
+                    with SocketClient(room.socket_ip, room.socket_port) as client:
+                        l_ok, l_resp = client.send_command("who")
+                        if l_ok and "players" in l_resp:
+                            lang_online_players = l_resp["players"]
+                except Exception:
+                    pass
+
+                if not lang_online_players:
+                    st.info("暫無玩家連接")
+                else:
+                    lang_device_ids = [p["device_id"] for p in lang_online_players]
+                    selected_lang = []
+                    lang_cbs = st.columns(4)
+                    for idx, dev_id in enumerate(lang_device_ids):
+                        with lang_cbs[idx % 4]:
+                            if st.checkbox(get_sound_device_display(dev_id), key=f"lang_cb_{room.room_id}_{dev_id}"):
+                                selected_lang.append(dev_id)
+
+                    lang_sel_zh, lang_sel_en = st.columns(2)
+                    with lang_sel_zh:
+                        if st.button("選取 → 中文", key=f"lang_sel_zh_{room.room_id}", use_container_width=True):
+                            if not selected_lang:
+                                st.toast("⚠️ 請至少勾選一台設備", icon="⚠️")
+                            else:
+                                n, fails = send_language_command(room, 0, target_device_ids=selected_lang)
+                                if n:
+                                    st.toast(f"✅ 已對 {n} 台切換為中文")
+                                if fails:
+                                    st.toast("❌ 部分失敗：" + "；".join(fails), icon="⚠️")
+                    with lang_sel_en:
+                        if st.button("選取 → 英文", key=f"lang_sel_en_{room.room_id}", use_container_width=True):
+                            if not selected_lang:
+                                st.toast("⚠️ 請至少勾選一台設備", icon="⚠️")
+                            else:
+                                n, fails = send_language_command(room, 1, target_device_ids=selected_lang)
+                                if n:
+                                    st.toast(f"✅ 已對 {n} 台切換為英文")
+                                if fails:
+                                    st.toast("❌ 部分失敗：" + "；".join(fails), icon="⚠️")
 
         with tab2:
             # 日誌視窗

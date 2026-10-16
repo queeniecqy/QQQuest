@@ -55,6 +55,10 @@ namespace MultiPlayer
         [Tooltip("收到後台 play_sound 指令時播放一次音效。需在 Inspector 指定場景中的 SoundTrigger。")]
         public SoundTrigger soundTrigger;
 
+        [Tooltip("收到後台 set_language 指令時切換語言。把場景中的 LanguageObjectActiveSwitcher 拉進來即可" +
+                 "（0 = 第一個 group / 中文、1 = 第二個 group / 英文）。")]
+        public LanguageObjectActiveSwitcher languageSwitcher;
+
         // TCP
         private TcpClient _client;
         private NetworkStream _stream;
@@ -87,6 +91,9 @@ namespace MultiPlayer
         [Header("Server Event Handler")]
         public UnityEvent GameStartUEvent = new UnityEvent();
         public UnityEvent<int> MoveChapterUEvent = new UnityEvent<int>();
+        // 語言切換：0 = 中文、1 = 英文。請在 Inspector 把這個事件接到 LanguageSwitch 的
+        // Current Group Index（把 LanguageSwitch 上設定 group index 的 public 方法/屬性拉進來）。
+        public UnityEvent<int> SetLanguageUEvent = new UnityEvent<int>();
 
         #region To Server Objects
         private HeartbeatPayload heartbeatPayload;
@@ -510,6 +517,12 @@ namespace MultiPlayer
                 return;
             }
 
+            if (string.Equals(msg_type, "set_language", StringComparison.OrdinalIgnoreCase))
+            {
+                HandleSetLanguage(msg);
+                return;
+            }
+
             SocketMsgType.FromServer fromServerType = SocketMsgType.GetFromServerMessageType(msg_type);
 
             switch (fromServerType)
@@ -583,6 +596,40 @@ namespace MultiPlayer
             {
                 Debug.LogWarning("<color=yellow>[TCP CoPlayer]</color> 收到 play_sound 但未指定 soundTrigger。");
             }
+        }
+
+        // 收到後台 set_language 指令：切換語言（group_index：0 = 中文、1 = 英文）。
+        // 透過 SetLanguageUEvent 通知；請在 Inspector 把它接到 LanguageSwitch 的 Current Group Index。
+        private void HandleSetLanguage(string msg)
+        {
+            int groupIndex = 0;
+            try
+            {
+                SetLanguageEnvelope env = JsonUtility.FromJson<SetLanguageEnvelope>(msg);
+                if (env != null)
+                    groupIndex = env.group_index;
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning($"<color=yellow>[TCP CoPlayer]</color> set_language 解析失敗，改用 0(中文)：{e.Message}");
+            }
+
+            groupIndex = groupIndex == 1 ? 1 : 0;   // 夾在 0/1
+
+            // 直接呼叫 LanguageObjectActiveSwitcher.SetGroup()（會設 index 並真正套用語言）——最穩，
+            // 不必在 Inspector 接 dynamic int。只要把 languageSwitcher 拉進來即可。
+            if (languageSwitcher != null)
+            {
+                languageSwitcher.SetGroup(groupIndex);
+            }
+            else
+            {
+                Debug.LogWarning("<color=yellow>[TCP CoPlayer]</color> 收到 set_language 但未指定 languageSwitcher（改由 SetLanguageUEvent 通知，請確認事件已接好）。");
+            }
+
+            // 事件通知（給其他監聽者用；若你偏好用事件接線，也可接到 SetGroup 的 dynamic int）
+            SetLanguageUEvent.Invoke(groupIndex);
+            Debug.Log($"<color=cyan>[TCP CoPlayer]</color> set_language -> SetGroup({groupIndex}) ({(groupIndex == 0 ? "中文" : "英文")})");
         }
 
         private void OnChapterChange(int newChapter)
@@ -811,6 +858,13 @@ namespace MultiPlayer
         public string message_type;
         public string device_id;
         public int sound_index;
+    }
+
+    [Serializable]
+    public class SetLanguageEnvelope
+    {
+        public string message_type;
+        public int group_index;   // 0 = 中文、1 = 英文
     }
 
     [Serializable]

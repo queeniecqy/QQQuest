@@ -33,18 +33,21 @@ TEMPERATURE_HIGH_THRESHOLD = 40  # 高溫警告閾值（°C）
 
 # scrcpy 監看設定
 SCRCPY_CONFIG: Dict[str, Any] = {
-    "bitrate": "8M",           # 視訊位元率（例如：8M, 16M, 2M）
-    "max_size": 1024,          # 最大畫面寬度（像素）
-    "max_fps": 60,             # 最大幀率（0 = 無限制）
+    # 以下三項為「限流」預設（原本 8M/1024/60），降低監看頻寬。全系統唯一的預設來源；
+    # 要調整請到「系統設定 → scrcpy 監看設定」，start_scrcpy 會直接讀這份設定。
+    "bitrate": "2M",           # 視訊位元率（例如：2M, 4M, 8M）
+    "max_size": 800,           # 最大畫面寬度（像素）
+    "max_fps": 15,             # 最大幀率（0 = 無限制）
+    "no_control": True,        # 唯讀監看（--no-control）：只看不控制，省頻寬也防誤觸
     "window_width": None,      # 視窗寬度（None = 自動）
     "window_height": None,     # 視窗高度（None = 自動）
     "window_x": None,          # 視窗 X 座標（None = 自動）
     "window_y": None,          # 視窗 Y 座標（None = 自動）
-    "stay_awake": True,        # 保持設備清醒
-    "show_touches": False,     # 顯示觸控點
+    "stay_awake": True,        # 保持設備清醒（需要 control，no_control 時自動略過）
+    "show_touches": False,     # 顯示觸控點（需要 control）
     "fullscreen": False,       # 全螢幕模式
     "always_on_top": False,    # 視窗置頂
-    "turn_screen_off": False,  # 關閉設備螢幕（只鏡像）
+    "turn_screen_off": False,  # 關閉設備螢幕（只鏡像，需要 control）
     "enable_audio": False,     # 啟用音訊轉發（預設關閉以避免關閉 Quest 聲音）
     "render_driver": None,     # 渲染驅動（None = 自動，或 "opengl", "opengles2", "opengles", "metal", "software"）
 }
@@ -81,6 +84,13 @@ NETWORK_MONITORING_CONFIG: Dict[str, Any] = {
         "only_not_connected": True,  # 僅 Ping 未連接設備
         "only_wifi_devices": True,   # 僅 Ping WiFi 設備
     }
+}
+
+# vrcontrol WebRTC 監控（畫面牆的 WebRTC 模式；由 QQQuest 代管啟動 Go 伺服器，
+# 畫面格由 QQQuest 自己畫、直連它的 signaling WebSocket，不需要 vrcontrol 前端）
+VRCONTROL_CONFIG: Dict[str, Any] = {
+    "root": str(Path.home() / "Downloads" / "vrcontrol"),  # vrcontrol 專案路徑
+    "api_port": 8080,  # vrcontrol Go API 埠（預設 8080）
 }
 
 # UI 設定
@@ -130,6 +140,7 @@ def get_user_config() -> Dict[str, Any]:
         "scrcpy": SCRCPY_CONFIG.copy(),
         "screenshot": SCREENSHOT_CONFIG.copy(),
         "network_monitoring": NETWORK_MONITORING_CONFIG.copy(),
+        "vrcontrol": VRCONTROL_CONFIG.copy(),
     }
     
     if USER_CONFIG_DB.exists():

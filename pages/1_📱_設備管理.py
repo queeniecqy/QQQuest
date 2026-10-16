@@ -108,6 +108,54 @@ st.markdown("""
     [data-testid="stTooltipHoverTarget"] {
         justify-content: center !important;
     }
+
+    /* ---------- 頂部工具列 ---------- */
+    /* 工具列與下方內容拉開距離，按鈕本身也長高一點，不要擠成一團 */
+    div[class*="st-key-btn_add_device"] button,
+    div[class*="st-key-btn_refresh"] button,
+    div[class*="st-key-btn_batch_connect"] button,
+    div[class*="st-key-btn_no_sleep"] button,
+    div[class*="st-key-btn_install_helper"] button {
+        min-height: 2.6rem !important;
+        border-radius: 8px !important;
+        font-weight: 500 !important;
+    }
+
+    /* 工具列整排與下方內容拉開距離 */
+    div[data-testid="stHorizontalBlock"]:has(div[class*="st-key-btn_batch_connect"]) {
+        margin-bottom: 1.1rem !important;
+    }
+    /* 標題與工具列之間留白 */
+    div[data-testid="stHorizontalBlock"]:has(div[class*="st-key-btn_batch_connect"]) {
+        margin-top: 0.5rem !important;
+    }
+
+    /* ---------- 一鍵連接：高亮 ---------- */
+    div[class*="st-key-btn_batch_connect"] button {
+        background: linear-gradient(135deg, #16a34a 0%, #12833f 100%) !important;
+        color: #ffffff !important;
+        border: 1px solid #12833f !important;
+        font-weight: 700 !important;
+        letter-spacing: .3px !important;
+        box-shadow: 0 2px 10px rgba(22, 163, 74, .38) !important;
+        transition: transform .08s ease, box-shadow .18s ease, background .18s ease !important;
+    }
+    div[class*="st-key-btn_batch_connect"] button:hover {
+        background: linear-gradient(135deg, #1cb856 0%, #16a34a 100%) !important;
+        box-shadow: 0 5px 16px rgba(22, 163, 74, .5) !important;
+        transform: translateY(-1px) !important;
+        border-color: #16a34a !important;
+    }
+    div[class*="st-key-btn_batch_connect"] button:active {
+        transform: translateY(0) !important;
+        box-shadow: 0 2px 8px rgba(22, 163, 74, .4) !important;
+    }
+    /* 按鈕內文字也要跟著變白（Streamlit 有時把顏色掛在內層 p） */
+    div[class*="st-key-btn_batch_connect"] button p,
+    div[class*="st-key-btn_batch_connect"] button div {
+        color: #ffffff !important;
+        font-weight: 700 !important;
+    }
     </style>
 """, unsafe_allow_html=True)
 
@@ -758,87 +806,317 @@ def render_device_card(device: Device):
 
 def main():
     """主函數"""
-    import asyncio  # Import locally to avoid potential top-level await issues if any
     
     st.title("📱 設備管理")
     
     # 頂部操作欄
-    col1, col2, col3 = st.columns([1, 1, 2])
-    
+    col1, col2, col3, col4, col5 = st.columns([1, 1, 1.5, 1.15, 1.25], gap="medium")
+
     with col1:
-        if st.button("➕ 新增設備", type="primary", use_container_width=True):
+        if st.button("➕ 新增設備", key="btn_add_device", use_container_width=True):
             st.session_state.show_add_device_dialog = True
-            
+
     with col2:
-        if st.button("🔄 刷新狀態", use_container_width=True):
+        if st.button("🔄 刷新狀態", key="btn_refresh", use_container_width=True):
             st.rerun()
 
-    # Async Scan Button
-    if st.button("⚡ 極速掃描 (Async)", use_container_width=True):
-        devices = st.session_state.device_registry.get_all_devices()
-        if not devices:
-            st.warning("沒有設備可掃描")
+    with col3:
+        if st.button("🔗 一鍵連接所有設備", key="btn_batch_connect", use_container_width=True,
+                     help="對清單中所有設定了 IP 的設備並發執行 adb connect"):
+            st.session_state.batch_connect_requested = True
+
+    # 一鍵連接的結果：執行後會 rerun 讓設備卡片狀態更新，訊息會被沖掉，
+    # 所以先存進 session_state，rerun 後再顯示。
+    _bc = st.session_state.pop('batch_connect_result', None)
+    if _bc:
+        _rescued = _bc.get('rescued', 0)
+        _total_ok = _bc['ok'] + _rescued
+        _extra = f"（其中 {_rescued} 台是重開機後自動喚醒的）" if _rescued else ""
+        if _bc['fail']:
+            st.warning(f"⚠️ 一鍵連接完成：成功 {_total_ok}/{_bc['total']} 台{_extra}，失敗 {len(_bc['fail'])} 台")
+            with st.expander(f"查看失敗的 {len(_bc['fail'])} 台", expanded=False):
+                for _name, _msg in _bc['fail']:
+                    st.text(f"• {_name}：{_msg}")
+                st.caption("提示：若顯示「無線偵錯已關閉」，該台需戴上頭盔開一次 "
+                           "Oculus Wireless ADB；其餘多半是設備睡著或關機。")
         else:
-            status_placeholder = st.empty()
-            with status_placeholder.container():
-                st.info("🚀 正在並行掃描所有設備...")
-                progress_bar = st.progress(0)
-                
-                # Table for results
-                result_data = []
-                
-                async def scan_single(device):
-                    start_t = time.time()
-                    if not device.ip:
-                        return device.display_name, "Skipped (No IP)", 0.0, False
-                        
-                    # 1. Ping
-                    ping_time = await asyncio.to_thread(st.session_state.adb_manager.ping_device, device.ip, 1) # simple ping
-                    
-                    # 2. ADB Connect (if needed) or Status Check
-                    status_dict = await st.session_state.adb_manager.get_device_status_async(device.connection_string)
-                    
-                    end_t = time.time()
-                    duration = end_t - start_t
-                    
-                    # Update device object
-                    if status_dict['battery'] > 0:
-                        device.battery = status_dict['battery']
-                        device.temperature = status_dict['temperature']
-                        device.is_charging = status_dict['is_charging']
-                        device.status = DeviceStatus.ONLINE
-                        st.session_state.device_registry.save_device(device)
-                        return device.display_name, "Updated", duration, True
-                    elif ping_time is not None:
-                        # Ping success but ADB failed to return status implies connected to network but not fully ADB ready or unauthorized
-                         return device.display_name, f"Ping: {ping_time*1000:.0f}ms (ADB Fail)", duration, False
+            st.success(f"✅ 一鍵連接完成：{_total_ok}/{_bc['total']} 台全部連上{_extra}")
+        if _bc.get('skipped'):
+            st.caption(f"（略過 {_bc['skipped']} 台沒有設定 IP 的設備）")
+
+    # 執行一鍵連接：對所有有 IP 的設備並發 adb connect
+    if st.session_state.pop('batch_connect_requested', False):
+        _all = st.session_state.device_registry.get_all_devices()
+        _targets = [d for d in _all if d.ip]
+        _skipped = len(_all) - len(_targets)
+
+        if not _targets:
+            st.warning("⚠️ 沒有可連接的設備（清單中沒有設定 IP 的設備）")
+        else:
+            _prog = st.progress(0.0, text=f"正在連接 {len(_targets)} 台設備…")
+
+            def _bc_progress(done, total):
+                # connect_batch 是在主執行緒回呼的，可安全更新 Streamlit UI
+                try:
+                    _prog.progress(done / total, text=f"已完成 {done}/{total} 台")
+                except Exception:
+                    pass
+
+            logger.info(f"🔗 一鍵連接：開始並發連接 {len(_targets)} 台")
+            _results = st.session_state.adb_manager.connect_batch(
+                [(d.ip, d.port) for d in _targets],
+                max_workers=10,
+                progress_callback=_bc_progress,
+            )
+            _prog.empty()
+
+            # 重要：adb connect 會樂觀回報 "connected"，即使設備根本沒上線。
+            # 真正的依據是 adb devices 裡的狀態，所以連完再查一次實際狀態。
+            _live = {}
+            try:
+                for _d in st.session_state.adb_manager.get_devices(use_cache=False):
+                    _live[_d.get('serial')] = _d.get('state')
+            except Exception as _e:
+                logger.warning(f"一鍵連接：查詢實際設備狀態失敗 {_e}")
+
+            _adb_mgr = st.session_state.adb_manager
+
+            def _mark_connected(dev):
+                if not dev:
+                    return
+                dev.last_seen = datetime.now()
+                st.session_state.device_registry.save_device(dev)
+                # 趁連上時順手確保無線偵錯已開，作為「下次重開機」的救援通道。
+                # 沒有它，重開機後 5555 消失就只能接 USB 或戴頭盔。
+                try:
+                    _adb_mgr.ensure_wireless_debugging(dev.connection_string)
+                except Exception:
+                    pass
+                # 手動連上就重置自動連接重試計數（與單台「重新連線」行為一致）
+                if 'auto_connect_manager' in st.session_state:
+                    try:
+                        st.session_state.auto_connect_manager.reset_retry_count(dev.device_id)
+                    except Exception:
+                        pass
+
+            _by_conn = {f"{d.ip}:{d.port}": d for d in _targets}
+            _ok, _pending = 0, []
+            for _conn, _success, _msg in _results:
+                _dev = _by_conn.get(_conn)
+                _state = _live.get(_conn)
+                if _state == 'device':
+                    _ok += 1
+                    _mark_connected(_dev)
+                else:
+                    _pending.append((_dev, _conn, _state, _msg))
+
+            # 第二輪：對連不上的設備做 mDNS 救援。
+            # Quest 重開機後 5555 會被清空（service.adb.tcp.port 非持久屬性），但只要該機
+            # 無線偵錯還開著，就能從 mDNS 廣播的 TLS 埠連進去、重下 tcpip 5555 救回來，
+            # 全程不必接 USB 也不必戴頭盔。
+            _rescued, _fail = 0, []
+            if _pending:
+                from concurrent.futures import ThreadPoolExecutor
+
+                _rp = st.progress(0.0, text=f"嘗試喚醒 {len(_pending)} 台連不上的設備…")
+
+                # 必須在主執行緒先取出：worker thread 沒有 ScriptRunContext，
+                # 在裡面碰 st.session_state 會直接拋例外（救援會全部靜默失敗）。
+                _adb = _adb_mgr
+
+                def _rescue(item):
+                    dev, conn, state, msg = item
+                    if not dev or not dev.ip:
+                        return item, False, "沒有 IP，無法救援"
+                    try:
+                        _rok, _rmsg = _adb.reconnect_via_mdns(dev.ip, dev.port)
+                        return item, _rok, _rmsg
+                    except Exception as e:
+                        return item, False, f"救援發生例外：{e}"
+
+                with ThreadPoolExecutor(max_workers=6) as _ex:
+                    for _i, (_item, _rok, _rmsg) in enumerate(_ex.map(_rescue, _pending)):
+                        _dev, _conn, _state, _msg = _item
+                        _name = _dev.display_name if _dev else _conn
+                        if _rok:
+                            _rescued += 1
+                            _mark_connected(_dev)
+                            logger.info(f"🔗 mDNS 救援成功：{_name}")
+                        else:
+                            if _state == 'offline':
+                                _base = "狀態 offline"
+                            elif _state:
+                                _base = f"狀態 {_state}"
+                            else:
+                                _base = (_msg or '').strip()[:60] or "無回應"
+                            # 救援訊息的最後一行通常最能說明卡在哪
+                            _tail = (_rmsg or '').strip().splitlines()
+                            _hint = _tail[-1] if _tail else ""
+                            _fail.append((_name, f"{_base}；{_hint}"))
+                        try:
+                            _rp.progress((_i + 1) / len(_pending))
+                        except Exception:
+                            pass
+                _rp.empty()
+
+            st.session_state.batch_connect_result = {
+                'ok': _ok, 'rescued': _rescued, 'total': len(_targets),
+                'fail': _fail, 'skipped': _skipped,
+            }
+            logger.info(f"🔗 一鍵連接完成：直接連上 {_ok}、救援成功 {_rescued}、失敗 {len(_fail)}（共 {len(_targets)}）")
+            time.sleep(0.3)
+            st.rerun()
+
+    with col4:
+        if st.button("☀️ 防止休眠", key="btn_no_sleep", use_container_width=True,
+                     help="對目前連得上的設備套用防休眠設定。Quest 一旦真正休眠，adbd 會停止且"
+                          "無法遠端喚醒（不支援 Wake-on-LAN），所以只能事先預防。需趁設備醒著時執行。"):
+            st.session_state.no_sleep_requested = True
+
+    # 防休眠結果（執行後 rerun，訊息先存 session_state）
+    _ns = st.session_state.pop('no_sleep_result', None)
+    if _ns:
+        if _ns['total'] == 0:
+            st.warning("⚠️ 目前沒有連得上的設備，無法套用防休眠設定。\n\n"
+                       "Quest 一旦休眠，adbd 會整個停止且不支援 Wake-on-LAN，遠端無法喚醒——"
+                       "所以防休眠只能趁設備醒著（戴上頭盔或剛開機）時先設定好。")
+        elif _ns['fail']:
+            st.warning(f"⚠️ 防休眠設定：成功 {_ns['ok']}/{_ns['total']} 台，失敗 {len(_ns['fail'])} 台")
+            with st.expander(f"查看失敗的 {len(_ns['fail'])} 台", expanded=False):
+                for _n, _m in _ns['fail']:
+                    st.text(f"• {_n}：{_m}")
+        elif _ns['ok']:
+            st.success(f"✅ 已對 {_ns['ok']} 台套用防休眠設定")
+        if _ns.get('offline'):
+            st.caption(f"（略過 {_ns['offline']} 台目前連不上的設備——防休眠只能趁設備醒著時設定）")
+
+    with col5:
+        if st.button("📦 安裝 helper", key="btn_install_helper", use_container_width=True,
+                     help="對 USB 接著或無線連得上的設備安裝無線 ADB helper 並授權。"
+                          "USB 接著的會一併開啟 5555 與無線偵錯。"):
+            st.session_state.install_helper_requested = True
+
+    # 安裝 helper 的結果
+    _ih = st.session_state.pop('install_helper_result', None)
+    if _ih:
+        if _ih['total'] == 0:
+            st.warning("⚠️ 沒有可設定的設備。請用 USB 接上一台（頭盔裡要按過「允許 USB 偵錯」），"
+                       "或先讓設備無線連上。")
+        elif _ih['fail']:
+            st.warning(f"⚠️ 安裝 helper：成功 {_ih['ok']}/{_ih['total']} 台，失敗 {len(_ih['fail'])} 台")
+            with st.expander(f"查看失敗的 {len(_ih['fail'])} 台", expanded=False):
+                for _n, _m in _ih['fail']:
+                    st.text(f"• {_n}：{_m}")
+        else:
+            st.success(f"✅ 已對 {_ih['ok']} 台安裝 helper 並授權")
+        if _ih.get('detail'):
+            with st.expander("查看每台詳細結果", expanded=False):
+                for _line in _ih['detail']:
+                    st.text(_line)
+        if _ih.get('need_headset'):
+            st.info("💡 有 " + str(len(_ih['need_headset'])) + " 台的「無線偵錯」被系統擋下（"
+                    + "、".join(_ih['need_headset']) + "）。\n\n"
+                    "這代表該台還沒信任目前這個 Wi-Fi。請戴上頭盔（螢幕要亮）→ 應用程式庫 → "
+                    "篩選「未知來源」→ 開啟 Oculus Wireless ADB → 按「允許」並勾「一律允許」。\n\n"
+                    "做完之後，該台重開機才能靠「一鍵連接」自動恢復，否則仍需接 USB。")
+
+    # 執行安裝 helper
+    if st.session_state.pop('install_helper_requested', False):
+        from pathlib import Path as _Path
+        _adb_h = st.session_state.adb_manager
+        _apk = str(_Path(__file__).resolve().parent.parent / "data" / "helper"
+                   / "tdg.oculuswirelessadb-1.3.apk")
+
+        # USB 接著的（serial 不含冒號）+ 無線連得上的，都納入
+        _devs = _adb_h.get_devices(use_cache=False)
+        _usb = [d['serial'] for d in _devs if d.get('state') == 'device' and ':' not in d.get('serial', '')]
+        _wifi = [d['serial'] for d in _devs if d.get('state') == 'device' and ':' in d.get('serial', '')]
+        _unauth = [d['serial'] for d in _devs if d.get('state') == 'unauthorized']
+        _all_t = _usb + _wifi
+
+        if not _all_t:
+            _msg = []
+            if _unauth:
+                _msg.append(f"有 {len(_unauth)} 台 USB 設備未授權，請戴上頭盔按「允許 USB 偵錯」")
+            st.session_state.install_helper_result = {
+                'ok': 0, 'total': 0, 'fail': [], 'detail': _msg, 'need_headset': []}
+        else:
+            _ihp = st.progress(0.0, text=f"對 {len(_all_t)} 台安裝 helper…")
+            _ih_ok, _ih_fail, _detail, _need_hs = 0, [], [], []
+            for _i, _t in enumerate(_all_t):
+                _is_usb = ':' not in _t
+                _label = _t
+                try:
+                    _r_ok, _r_msg = _adb_h.install_wireless_helper(_t, _apk)
+                    if _r_ok:
+                        _ih_ok += 1
+                        _line = f"{_label}：{_r_msg}"
+                        # 順便開無線偵錯（USB 的再開 5555）
+                        _w_ok, _w_msg = _adb_h.ensure_wireless_debugging(_t)
+                        _line += f"｜無線偵錯：{'✅' if _w_ok else '❌'}"
+                        if not _w_ok:
+                            _need_hs.append(_label)
+                        if _is_usb:
+                            _adb_h.enable_tcpip(_t, ADB_DEFAULT_PORT)
+                            _line += "｜已開 5555"
+                        _detail.append(_line)
                     else:
-                         return device.display_name, "Offline", duration, False
+                        _ih_fail.append((_label, _r_msg))
+                except Exception as _e:
+                    _ih_fail.append((_label, f"例外：{_e}"))
+                try:
+                    _ihp.progress((_i + 1) / len(_all_t))
+                except Exception:
+                    pass
+            _ihp.empty()
+            if _unauth:
+                _detail.append(f"⚠️ 另有 {len(_unauth)} 台 USB 未授權（{', '.join(_unauth)}），"
+                               "請戴上頭盔按「允許 USB 偵錯」")
+            st.session_state.install_helper_result = {
+                'ok': _ih_ok, 'total': len(_all_t), 'fail': _ih_fail,
+                'detail': _detail, 'need_headset': _need_hs}
+            logger.info(f"📦 安裝 helper：成功 {_ih_ok}/{len(_all_t)}")
+        time.sleep(0.3)
+        st.rerun()
 
-                async def run_scan():
-                    tasks = [scan_single(d) for d in devices]
-                    results = []
-                    for i, future in enumerate(asyncio.as_completed(tasks)):
-                        res = await future
-                        results.append(res)
-                        progress_bar.progress((i + 1) / len(devices))
-                    return results
+    # 執行防休眠：只對 adb 狀態為 device 的設備套用
+    if st.session_state.pop('no_sleep_requested', False):
+        _adb_m = st.session_state.adb_manager
+        _all_ns = st.session_state.device_registry.get_all_devices()
+        _live_ns = {d.get('serial') for d in _adb_m.get_devices(use_cache=False)
+                    if d.get('state') == 'device'}
+        _reachable = [d for d in _all_ns if d.connection_string in _live_ns]
+        _unreachable = len(_all_ns) - len(_reachable)
 
-                # Run Event Loop
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                results = loop.run_until_complete(run_scan())
-                loop.close()
-                
-                # Show Result Table
-                import pandas as pd
-                df = pd.DataFrame(results, columns=["Device", "Status", "Time (s)", "Success"])
-                st.dataframe(df, use_container_width=True)
-                
-                time.sleep(1) # Let user see the table briefly
-                st.success("掃描完成！")
-                time.sleep(1)
-                st.rerun()
+        if not _reachable:
+            st.session_state.no_sleep_result = {
+                'ok': 0, 'total': 0, 'fail': [], 'offline': _unreachable}
+            st.warning("⚠️ 目前沒有連得上的設備。防休眠設定必須趁設備醒著時套用——"
+                       "Quest 休眠後 adbd 會停止，無法遠端操作。")
+        else:
+            _nsp = st.progress(0.0, text=f"對 {len(_reachable)} 台套用防休眠設定…")
+            _ns_ok, _ns_fail = 0, []
+            for _i, _d in enumerate(_reachable):
+                try:
+                    _r_ok, _r_msg = _adb_m.prevent_sleep(_d.connection_string)
+                except Exception as _e:
+                    _r_ok, _r_msg = False, f"例外：{_e}"
+                if _r_ok:
+                    _ns_ok += 1
+                else:
+                    _ns_fail.append((_d.display_name, _r_msg[:150]))
+                try:
+                    _nsp.progress((_i + 1) / len(_reachable))
+                except Exception:
+                    pass
+            _nsp.empty()
+            st.session_state.no_sleep_result = {
+                'ok': _ns_ok, 'total': len(_reachable),
+                'fail': _ns_fail, 'offline': _unreachable}
+            logger.info(f"☀️ 防休眠：成功 {_ns_ok}/{len(_reachable)}")
+        time.sleep(0.3)
+        st.rerun()
+
 
 
 

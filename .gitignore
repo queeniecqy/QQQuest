@@ -38,6 +38,7 @@ wheels/
 data/*.json
 data/*.bak
 logs/**/*.log
+logs/**/*.pid
 temp/**
 
 # 保留範例檔案
@@ -59,5 +60,10 @@ Thumbs.db
 data/*.corrupt*
 data/*.bak-*
 data/devices.json.*
+# DHCP 保留表（含設備 MAC/IP，不上傳）；根目錄那份是從 UI 下載下來的
+data/*.csv
+/dhcp_reservations.csv
+# 無線 ADB helper APK（14MB，由 tools/setup_wireless_helper.py 自動下載）
+data/helper/
 # 背景音樂（版權/大檔，不上傳；bgm 資料夾由程式自動建立）
 bgm/*.mp3

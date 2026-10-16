@@ -115,8 +115,9 @@ class SocketServerManager:
             # 打開日誌文件用於寫入
             # 注意：這裡我們不使用 with 語句，因為進程需要一直持有文件句柄
             # 文件句柄會在進程結束時由操作系統關閉，或者我們可以在 stop_server 中處理
-            # 但最簡單的方式是讓 subprocess 管理它
-            log_file = open(log_file_path, "a", encoding="utf-8")
+            # 用 "w"（每次啟動就清空重來）而非 "a"（一直累加）——避免 Node log 無限長把磁碟撐爆。
+            # 心跳已在 Node 端過濾，單次連線期間 log 成長很慢；要保留歷史就手動備份此檔。
+            log_file = open(log_file_path, "w", encoding="utf-8")
             
             # 啟動進程（不等待完成），重定向輸出到日誌文件
             process = subprocess.Popen(

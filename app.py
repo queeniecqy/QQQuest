@@ -30,6 +30,7 @@ NAV_TITLES = {
         "devices": "設備管理",
         "rooms": "房間管理",
         "actions": "動作管理",
+        "screen_wall": "畫面牆",
         "settings": "系統設定",
     },
     "en": {
@@ -37,6 +38,7 @@ NAV_TITLES = {
         "devices": "Device Management",
         "rooms": "Room Management",
         "actions": "Action Management",
+        "screen_wall": "Screen Wall",
         "settings": "System Settings",
     },
 }
@@ -105,7 +107,8 @@ This is a Quest device group management system built on ADB and scrcpy, supporti
 - ⚡ **動作管理**：預設動作（休眠、開啟/關閉程式、傳送訊息）
 - ⏱️ **時間碼同步**：房間時間碼、高精度設備同步
 - 📅 **CUE 排程**：時間軸編輯、自動執行操作序列
-- 🖥️ **scrcpy 整合**：多設備螢幕鏡像
+- 📺 **scrcpy 監看**：單台/少量設備螢幕鏡像（已限流）
+- 🖥️ **畫面牆**：多台設備縮圖同時監看（裝置端縮圖，最省頻寬）
 
 ### 快速開始
 
@@ -165,6 +168,7 @@ def build_navigation():
             st.Page("pages/1_📱_設備管理.py", title=titles["devices"], icon="📱"),
             st.Page("pages/2_🏠_房間管理.py", title=titles["rooms"], icon="🏠"),
             st.Page("pages/3_⚡_動作管理.py", title=titles["actions"], icon="⚡"),
+            st.Page("pages/5_🖥️_畫面牆.py", title=titles["screen_wall"], icon="🖥️", url_path="screenwall"),
             st.Page("pages/4_⚙️_系統設定.py", title=titles["settings"], icon="⚙️"),
         ],
         position="sidebar",
